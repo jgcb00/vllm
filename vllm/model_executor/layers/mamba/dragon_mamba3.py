@@ -75,6 +75,19 @@ _FUSED_PREAMBLE = _os.environ.get("DRAGON_FUSED_PREAMBLE", "1") != "0"
 _STEP_TILE_D = 64
 _STEP_NUM_WARPS = 4
 
+# Fuse bias+rotary INTO the step kernel (indexed mode): the per-head rotated
+# B/C tensors are never materialized; the step kernel reads the
+# head-broadcast pre-rotation B/C through L2 and updates the angle pool
+# itself. Measured (GH200, graph-captured): fused wins ~1 us/layer at B=1
+# (kernel count) but LOSES ~26 us/layer at B=256 (the smem rotation stages
+# serialize against the cp.async pipeline at high occupancy) — so dispatch
+# by batch size; each cudagraph capture size takes one consistent branch.
+# DRAGON_FUSED_STEP_ROTARY=0 disables entirely.
+_FUSED_STEP_ROTARY = _os.environ.get("DRAGON_FUSED_STEP_ROTARY", "1") != "0"
+_FUSE_ROTARY_MAX_BATCH = int(
+    _os.environ.get("DRAGON_FUSE_ROTARY_MAX_BATCH", "64")
+)
+
 # External Mamba3 kernels (from the official ``mamba_ssm`` package). Imported
 # lazily so that this module is importable on hosts without the kernels.
 _mamba3_mimo = None
@@ -824,7 +837,29 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
         kernel_writes_kv = use_indexed and _STEP_TILE_D >= self.headdim
         slots32 = slots.to(torch.int32)
 
-        if use_indexed:
+        fuse_rot = (
+            use_indexed
+            and _FUSED_STEP_ROTARY
+            and u.shape[0] <= _FUSE_ROTARY_MAX_BATCH
+            and self.ngroups == 1
+            and angle_pool.dtype == torch.float32
+            # The kernel must own the k_pool write: the caller-side fallback
+            # scatter would store the PRE-rotation B.
+            and kernel_writes_kv
+        )
+        step_rotary_kwargs = {}
+        if fuse_rot:
+            # No separate rotary kernel: the step kernel applies bias+rotary
+            # to the (head-broadcast) pre-rotation B/C and updates angle_pool
+            # rows in place.
+            step_rotary_kwargs = dict(
+                rotary_dim=2 * self.num_rope_angles,
+                rotary_bias_q=bias_q,
+                rotary_bias_k=bias_k,
+                rotary_angle_proj=angle,
+                rotary_angle_state=angle_pool,
+            )
+        elif use_indexed:
             # Rotary reads/updates angle_pool rows in place via slot indices
             # (PAD_SLOT_ID lanes: q/k zeroed, pool untouched, kernel-side).
             C, B, _ = _apply_rotary_qk_inference_fwd(
@@ -885,6 +920,7 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 update_kv_state=kernel_writes_kv,
                 tile_D=_STEP_TILE_D,
                 num_warps=_STEP_NUM_WARPS,
+                **step_rotary_kwargs,
             )
             if not kernel_writes_kv:  # only if _STEP_TILE_D < headdim
                 slots_w = torch.where(slots >= 0, slots, torch.zeros_like(slots))
