@@ -855,7 +855,7 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 y,
                 z=z,
                 zproj=zpj,
-                state_indices=slots.to(torch.int32),
+                state_batch_indices=slots.to(torch.int32),
                 update_kv_state=kernel_writes_kv,
                 tile_D=_STEP_TILE_D,
                 num_warps=_STEP_NUM_WARPS,
