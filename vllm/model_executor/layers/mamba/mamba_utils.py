@@ -95,6 +95,36 @@ class MambaStateDtypeCalculator:
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         return (state_dtype, state_dtype, state_dtype, torch.float32)
 
+    @classmethod
+    def mamba3_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+    ) -> tuple[torch.dtype, torch.dtype, torch.dtype, torch.dtype]:
+        """Dragon Mamba3 MIMO: angle_state (fp32), ssm_state (bf16 storage by
+        default — compute stays fp32 in the kernels, validated quality-neutral
+        on gsm8k/humaneval/RULER 2026-06-10, +16% decode throughput at high
+        concurrency; set DRAGON_SSM_DTYPE=float32 to revert),
+        k_state (cache dtype), v_state (cache dtype)."""
+        import os
+        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        ssm_dtype = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[os.environ.get("DRAGON_SSM_DTYPE", "bfloat16")]
+        return (torch.float32, ssm_dtype, state_dtype, state_dtype)
+
+    @classmethod
+    def attn_last_kv_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+    ) -> tuple[torch.dtype, torch.dtype]:
+        """Dragon DifferentialTPA token-shift: (k_last, v_last) one-token
+        buffer holding raw pre-shift K/V."""
+        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        return (state_dtype, state_dtype)
+
 
 class MambaStateShapeCalculator:
     @classmethod
@@ -231,6 +261,47 @@ class MambaStateShapeCalculator:
             recurrent_state_shape,
         )
 
+    @classmethod
+    def mamba3_state_shape(
+        cls,
+        tp_world_size: int,
+        num_heads: int,
+        head_dim: int,
+        d_state: int,
+        mimo_dim: int,
+        num_rope_angles: int,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+        tuple[int, int],
+    ]:
+        """Dragon Mamba3 MIMO state layout.
+
+        4 tensors per request:
+          angle_state: (H/tp, num_rope_angles)
+          ssm_state:   (H/tp, headdim, d_state)
+          k_state:     (mimo_dim, H/tp, d_state)
+          v_state:     (H/tp, headdim)
+        """
+        nh = divide(num_heads, tp_world_size)
+        angle_shape = (nh, num_rope_angles)
+        ssm_shape = (nh, head_dim, d_state)
+        k_shape = (mimo_dim, nh, d_state)
+        v_shape = (nh, head_dim)
+        return angle_shape, ssm_shape, k_shape, v_shape
+
+    @classmethod
+    def attn_last_kv_state_shape(
+        cls,
+        tp_world_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Per-request (k_last, v_last) one-token buffer for token-shift."""
+        kv = divide(num_kv_heads, tp_world_size)
+        return (kv, head_dim), (kv, head_dim)
+
 
 @dataclass
 class MambaCopySpec:
@@ -318,3 +389,18 @@ class MambaStateCopyFuncCalculator:
             get_conv_copy_spec,
             get_temporal_copy_spec,
         )
+
+    @classmethod
+    def mamba3_state_copy_func(cls):
+        """Dragon Mamba3: all 4 state tensors are temporal (SSM-like)."""
+        return (
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+            get_temporal_copy_spec,
+        )
+
+    @classmethod
+    def attn_last_kv_state_copy_func(cls):
+        """Dragon DifferentialTPA token-shift: (k_last, v_last) temporal."""
+        return (get_temporal_copy_spec, get_temporal_copy_spec)

@@ -145,6 +145,10 @@ class MambaAttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     SHORT_CONV = "vllm.v1.attention.backends.short_conv_attn.ShortConvAttentionBackend"
     LINEAR = "vllm.v1.attention.backends.linear_attn.LinearAttentionBackend"
     GDN_ATTN = "vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend"
+    MAMBA3 = "vllm.v1.attention.backends.mamba3_attn.Mamba3AttentionBackend"
+    DRAGON_DIFF_TPA = (
+        "vllm.v1.attention.backends.dragon_diff_tpa_attn.DragonDiffTPABackend"
+    )
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None
@@ -199,6 +203,8 @@ MAMBA_TYPE_TO_BACKEND_MAP = {
     "short_conv": MambaAttentionBackendEnum.SHORT_CONV.name,
     "linear_attention": MambaAttentionBackendEnum.LINEAR.name,
     "gdn_attention": MambaAttentionBackendEnum.GDN_ATTN.name,
+    "mamba3": MambaAttentionBackendEnum.MAMBA3.name,
+    "dragon_diff_tpa": MambaAttentionBackendEnum.DRAGON_DIFF_TPA.name,
     "custom": MambaAttentionBackendEnum.CUSTOM.name,
 }
 

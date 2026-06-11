@@ -963,6 +963,27 @@ class Worker(WorkerBase):
 
         model = self.model_runner.model
 
+        if os.environ.get("RLP_PLAIN_RELOAD") == "1":
+            # Robust reload for custom models (e.g. Dragon): receive checkpoint-format
+            # weights and replicate the INITIAL-load path -- name mapping + MoE
+            # stacking in model.load_weights, then process_weights_after_loading --
+            # WITHOUT the layerwise meta-reset. The layerwise path resets every layer
+            # tensor (incl. non-persistent buffers like rotary inv_freq) to meta and
+            # only re-materializes a layer once its loaded element count equals
+            # load_numel_total; for Dragon that count never matches, so layers stay on
+            # meta and the model is corrupted. Plain reload overwrites param storage in
+            # place and leaves buffers intact, exactly like base_loader.load_model.
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+            with torch.device(self.device):
+                self.weight_transfer_engine.receive_weights(
+                    typed_update_info, load_weights=model.load_weights,
+                )
+                process_weights_after_loading(model, self.model_config, self.device)
+            torch.accelerator.synchronize()
+            return
+
         if typed_update_info.is_checkpoint_format:
             from vllm.model_executor.model_loader.reload import (
                 finalize_layerwise_reload,

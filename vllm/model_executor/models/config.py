@@ -714,8 +714,81 @@ class VoyageQwen3BidirectionalEmbedModelConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = model_config.hf_config.num_labels
 
 
+class DragonForCausalLMConfig(VerifyAndUpdateConfig):
+    """Dragon-specific config: Dragon's HF config has num_key_value_heads=0,
+    which makes HybridAttentionMambaModelConfig mis-compute attention page
+    sizes. Patch num_key_value_heads to the real DiffTPA value (num_noise
+    heads) so the standard hybrid alignment logic works correctly.
+
+    Also surface the MoE expert count (stored under Dragon's own
+    ``moe_num_routed_experts`` key) on both the HF config and vLLM's
+    ``model_arch_config`` so that ``--enable-expert-parallel`` and any
+    downstream checks that rely on ``num_experts`` / ``is_moe`` work.
+    """
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        mc = vllm_config.model_config
+        hf = mc.hf_config
+
+        num_signal = getattr(hf, "num_signal_heads_diff", 0) or (
+            hf.num_attention_heads // 2
+        )
+        real_num_kv = hf.num_attention_heads - num_signal
+
+        hf.num_key_value_heads = real_num_kv
+        mc.model_arch_config.total_num_kv_heads = real_num_kv
+        logger.info(
+            "Dragon: patching num_key_value_heads=%d (derived from "
+            "num_attention_heads - num_signal_heads_diff)",
+            real_num_kv,
+        )
+
+        if bool(getattr(hf, "moe", False)):
+            num_experts = int(getattr(hf, "moe_num_routed_experts", 0) or 0)
+            if num_experts > 0:
+                # Expose under vLLM's canonical name so the default extractor
+                # and `is_moe` work.
+                hf.num_experts = num_experts
+                mc.model_arch_config.num_experts = num_experts
+                logger.info(
+                    "Dragon: patching num_experts=%d (from "
+                    "moe_num_routed_experts)",
+                    num_experts,
+                )
+
+        # Dragon's Mamba3 MIMO varlen prefill kernel cannot be seeded with an
+        # initial SSM state. When chunked prefill splits a prompt mid-sequence
+        # (routine once several requests fill the token budget), the
+        # continuation chunk falls back to a per-token recurrence -- N tokens
+        # x Mamba layers of *serial* kernel launches. Under concurrency that
+        # path is pathologically slow and stalls the engine long enough to trip
+        # the server/client watchdog ("EngineCore died unexpectedly"). There is
+        # no init-state varlen kernel to fix it in-place, so force whole-prompt
+        # prefill: every prompt then runs the fast, well-tested zero-start
+        # varlen path (identical to single-request prefill, just batched).
+        sched = getattr(vllm_config, "scheduler_config", None)
+        if sched is not None and getattr(sched, "enable_chunked_prefill", False):
+            sched.enable_chunked_prefill = False
+            sched.long_prefill_token_threshold = 0
+            # A whole prompt must fit in one batch. The chunked-prefill default
+            # (max_num_batched_tokens=16384) already exceeds max_model_len, but
+            # clamp up if a smaller value was supplied so long prompts are not
+            # rejected.
+            need = int(getattr(mc, "max_model_len", 0) or 0)
+            if need and sched.max_num_batched_tokens < need:
+                sched.max_num_batched_tokens = need
+            logger.info(
+                "Dragon: disabling chunked prefill (mamba3 varlen kernel has "
+                "no init-state continuation; mid-prompt splitting would force "
+                "a slow per-token fallback). max_num_batched_tokens=%d",
+                sched.max_num_batched_tokens,
+            )
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
+    "DragonForCausalLM": DragonForCausalLMConfig,
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501

@@ -800,6 +800,11 @@ def get_model_params(config):
         topk = config.moe_topk[0]
         intermediate_size = config.moe_intermediate_size[0]
         hidden_size = config.hidden_size
+    elif architecture == "DragonForCausalLM":
+        E = config.moe_num_routed_experts
+        topk = config.moe_num_active_experts
+        intermediate_size = config.moe_routed_intermediate_size
+        hidden_size = config.moe_routed_input_dim
     elif architecture == "Qwen3OmniMoeForConditionalGeneration":
         E = config.thinker_config.text_config.num_experts
         topk = config.thinker_config.text_config.num_experts_per_tok
