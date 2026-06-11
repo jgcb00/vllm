@@ -959,7 +959,12 @@ target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 
 # add OR VLLM_GPU_LANG STREQUAL "HIP" here once
 # https://github.com/vllm-project/vllm/issues/35163 is resolved
-if(VLLM_GPU_LANG STREQUAL "CUDA")
+# NOTE: _C_stable_libtorch requires the torch>=2.10 stable-ABI macro TORCH_BOX,
+# which is absent in torch 2.9.1 (the version this env is pinned to, matching the
+# Dragon training stack). Its ops (permute_cols, fp8/int8 per-token-group quant)
+# are unused by bf16 Dragon inference, so the extension is disabled here. The
+# import in vllm/platforms/cuda.py is made optional to match.
+if(FALSE AND VLLM_GPU_LANG STREQUAL "CUDA")
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
   #

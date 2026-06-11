@@ -1002,7 +1002,9 @@ if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     # also _is_hip() once https://github.com/vllm-project/vllm/issues/35163 is
     # fixed
-    if _is_cuda():
+    # _C_stable_libtorch disabled for torch 2.9.1 (needs torch>=2.10 TORCH_BOX);
+    # see CMakeLists.txt and vllm/platforms/cuda.py.
+    if False and _is_cuda():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
 
 package_data = {
