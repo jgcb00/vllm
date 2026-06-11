@@ -69,6 +69,14 @@ _INDEXED_STEP = _os.environ.get("DRAGON_INDEXED_STEP", "1") != "0"
 # DRAGON_FUSED_PREAMBLE=0 restores the eager ops.
 _FUSED_PREAMBLE = _os.environ.get("DRAGON_FUSED_PREAMBLE", "1") != "0"
 
+# CuteDSL decode-step launch config. tile_D covers the full headdim (64), so
+# exactly one CTA owns each (batch, head) row — the precondition for asking
+# the kernel to store the new B/x key/value states itself
+# (``update_kv_state``). Keep call sites and that decision on this single
+# pair of constants.
+_STEP_TILE_D = 64
+_STEP_NUM_WARPS = 4
+
 # External Mamba3 kernels (from the official ``mamba_ssm`` package). Imported
 # lazily so that this module is importable on hosts without the kernels.
 _mamba3_mimo = None
@@ -745,6 +753,9 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
             # Two Triton kernels replace ~14 tiny eager kernels per call:
             # (1) x/z head-deinterleave + A/dt/trap activation scalars,
             # (2) B/C RMS norm + weight, written bf16 into one buffer.
+            # Numerics note: DT/trap_s come out fp32 here (the eager path
+            # below yields bf16, rounding per op) — strictly more precise;
+            # greedy outputs can differ from the eager path within bf16 noise.
             zxdt, _ = self.in_proj(u)
             bc, _ = self.in_proj_dyn(u)
             n_tok = u.shape[0]
@@ -823,7 +834,6 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
         )
         # With tile_D >= headdim the indexed kernel also stores the new B/x
         # key/value states itself (one CTA per (b, h)) — skip those scatters.
-        _STEP_TILE_D = 64
         kernel_writes_kv = use_indexed and _STEP_TILE_D >= self.headdim
         if use_indexed:
             # Kernel reads/updates the pool rows directly via slot indices —
@@ -846,8 +856,9 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 z=z,
                 zproj=zpj,
                 state_indices=slots.to(torch.int32),
+                update_kv_state=kernel_writes_kv,
                 tile_D=_STEP_TILE_D,
-                num_warps=4,
+                num_warps=_STEP_NUM_WARPS,
             )
         else:
             ssm_state = ssm_pool[slots].to(torch.float32)
@@ -871,8 +882,8 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 y,
                 z=z,
                 zproj=zpj,
-                tile_D=64,
-                num_warps=4,
+                tile_D=_STEP_TILE_D,
+                num_warps=_STEP_NUM_WARPS,
             )
             ssm_pool[slots_w] = state_out
 

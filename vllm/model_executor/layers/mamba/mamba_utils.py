@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -106,7 +107,6 @@ class MambaStateDtypeCalculator:
         on gsm8k/humaneval/RULER 2026-06-10, +16% decode throughput at high
         concurrency; set DRAGON_SSM_DTYPE=float32 to revert),
         k_state (cache dtype), v_state (cache dtype)."""
-        import os
         state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         ssm_dtype = {
             "float32": torch.float32,

@@ -95,7 +95,7 @@ if _DPROF:
     _ACC = _c.defaultdict(float)
     _CNT = _c.defaultdict(int)
     _PROF_OUT = _os.environ.get("DRAGON_PROFILE_OUT",
-                                "/e/scratch/jureap140/dragon_comp_prof.json")
+                                "dragon_comp_prof.json")
 
     def _timed(key, fn):
         s = torch.cuda.Event(enable_timing=True)
