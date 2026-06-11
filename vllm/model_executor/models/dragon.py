@@ -614,8 +614,13 @@ class DragonMonoBlock(nn.Module):
         n = hidden_states.shape[0]
 
         # -- Mixer path -------------------------------------------------------
+        # lns == 1.0 (no layer_norm_scaling) and Identity norms (geodesic
+        # mode) would still launch a scalar-mul kernel + allocate per call —
+        # 72 wasted kernels/step across the stack. Skip the no-op multiply.
         residual = hidden_states
-        x = self.lns * self.input_norm(hidden_states)
+        x = self.input_norm(hidden_states)
+        if self.lns != 1.0:
+            x = self.lns * x
         y_mix_flat = _timed(f"mixer_{self.layer_type}", lambda: self._mix(x, positions))  # (N, H_local*D)
         if self.use_gate:
             g_all, _ = self.gate_proj(x)
@@ -633,7 +638,9 @@ class DragonMonoBlock(nn.Module):
 
         # -- MLP path --------------------------------------------------------
         residual = hidden_states
-        x = self.lns * self.postmixer_norm(hidden_states)
+        x = self.postmixer_norm(hidden_states)
+        if self.lns != 1.0:
+            x = self.lns * x
         y_mlp = _timed("mlp/moe", lambda: self.mlp(x))
         if self.is_geodesic:
             hidden_states = _timed("geodesic", lambda: self.geodesic_mlp(residual, y_mlp))

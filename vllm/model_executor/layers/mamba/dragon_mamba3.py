@@ -668,6 +668,21 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
 
         cu_seqlens = qsl_k.to(torch.int32)               # (P+1[+1],)
 
+        # Constant fp32 weight casts, computed once on first prefill and
+        # cached (was 6 cast kernels + allocations per layer per prefill).
+        cw = getattr(self, "_prefill_const_w", None)
+        if cw is None:
+            cw = (
+                self.C_bias.to(torch.float32),
+                self.B_bias.to(torch.float32),
+                self.in_proj_mimo_x.to(torch.float32),
+                self.in_proj_mimo_z.to(torch.float32),
+                self.out_proj_mimo.to(torch.float32),
+                self.D.to(torch.float32),
+            )
+            self._prefill_const_w = cw
+        q_bias_f32, k_bias_f32, mimo_v_f32, mimo_z_f32, mimo_out_f32, d_f32 = cw
+
         Out, Final_Angle, Final_SSM, Final_K, Final_V = _mamba3_mimo(
             Q=C.contiguous().bfloat16(),
             K=B.contiguous().bfloat16(),
@@ -675,13 +690,13 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
             ADT=ADT,
             DT=DT,
             Trap=trap,
-            Q_bias=self.C_bias.to(torch.float32),
-            K_bias=self.B_bias.to(torch.float32),
-            MIMO_V=self.in_proj_mimo_x.to(torch.float32),
-            MIMO_Z=self.in_proj_mimo_z.to(torch.float32),
-            MIMO_Out=self.out_proj_mimo.to(torch.float32),
+            Q_bias=q_bias_f32,
+            K_bias=k_bias_f32,
+            MIMO_V=mimo_v_f32,
+            MIMO_Z=mimo_z_f32,
+            MIMO_Out=mimo_out_f32,
             Angles=angle,
-            D=self.D.to(torch.float32),
+            D=d_f32,
             Z=z.contiguous(),
             chunk_size=self.chunk_size,
             rotary_dim_divisor=self.rotary_dim_divisor,
