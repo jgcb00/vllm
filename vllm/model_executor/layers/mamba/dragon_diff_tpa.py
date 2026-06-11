@@ -51,11 +51,79 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.dragon_diff_tpa_attn import (
     DragonDiffTPAMetadata,
 )
 
 from .dragon_mamba3 import _DragonRMSNorm
+
+import os as _os
+
+# Fused decode token-shift: one Triton kernel replaces the per-V-layer
+# gather + scatter + zeros + sigmoid/blend chain (~10 kernels/layer/step).
+# DRAGON_FUSED_TOKEN_SHIFT=0 restores the eager ops.
+_FUSED_TOKEN_SHIFT = _os.environ.get("DRAGON_FUSED_TOKEN_SHIFT", "1") != "0"
+
+
+@triton.jit
+def _token_shift_decode_kernel(
+    k_ptr, v_ptr,            # (N, Hkv, D) current k/v
+    ks_ptr, vs_ptr,          # (N, Hkv, D) shifted outputs
+    kpool_ptr, vpool_ptr,    # (P, Hkv, D) 1-token side pools
+    ak_ptr, av_ptr,          # (N, Hkv) raw shift logits (pre-sigmoid)
+    slots_ptr,               # (N,) int32 pool rows, PAD_SLOT_ID < 0
+    pos_ptr,                 # (N,) positions; pos == 0 disables the shift
+    H,
+    P,                       # pool rows: out-of-range slots (CUDA-graph
+                             # capture dummies) are treated as padding
+    stride_kn, stride_kh,
+    stride_pn, stride_ph,
+    stride_an,
+    D: tl.constexpr,
+):
+    """Per (token, kv-head): ``shifted = sigmoid(a) * pool_prev +
+    (1 - sigmoid(a)) * cur`` then store ``cur`` into the pool row.
+
+    Padding lanes (slot < 0) blend against zero and leave the pool
+    untouched. Blending is fp32 (the eager path rounded per-op to bf16).
+    """
+    pid = tl.program_id(0)
+    n = pid // H
+    h = pid % H
+    slot = tl.load(slots_ptr + n)
+    valid = (slot >= 0) & (slot < P)
+    # int64: the pools are page-strided views (row stride ~4.4e5), so
+    # int32 srow * stride overflows once slot ids grow with uptime.
+    srow = tl.minimum(tl.maximum(slot, 0), P - 1).to(tl.int64)
+
+    offs = tl.arange(0, D)
+    k = tl.load(k_ptr + n * stride_kn + h * stride_kh + offs).to(tl.float32)
+    v = tl.load(v_ptr + n * stride_kn + h * stride_kh + offs).to(tl.float32)
+    kp = tl.load(kpool_ptr + srow * stride_pn + h * stride_ph + offs,
+                 mask=tl.full([D], 1, tl.int1) & valid, other=0.0
+                 ).to(tl.float32)
+    vp = tl.load(vpool_ptr + srow * stride_pn + h * stride_ph + offs,
+                 mask=tl.full([D], 1, tl.int1) & valid, other=0.0
+                 ).to(tl.float32)
+    ak = tl.sigmoid(tl.load(ak_ptr + n * stride_an + h).to(tl.float32))
+    av = tl.sigmoid(tl.load(av_ptr + n * stride_an + h).to(tl.float32))
+    # Document start (position 0): no previous token — shift disabled.
+    pos = tl.load(pos_ptr + n)
+    ak = tl.where(pos == 0, 0.0, ak)
+    av = tl.where(pos == 0, 0.0, av)
+
+    tl.store(ks_ptr + n * stride_kn + h * stride_kh + offs,
+             (ak * kp + (1.0 - ak) * k).to(ks_ptr.dtype.element_ty))
+    tl.store(vs_ptr + n * stride_kn + h * stride_kh + offs,
+             (av * vp + (1.0 - av) * v).to(vs_ptr.dtype.element_ty))
+    # Store the current k/v as the next step's "previous" (pad lanes skip).
+    tl.store(kpool_ptr + srow * stride_pn + h * stride_ph + offs,
+             k.to(kpool_ptr.dtype.element_ty),
+             mask=tl.full([D], 1, tl.int1) & valid)
+    tl.store(vpool_ptr + srow * stride_pn + h * stride_ph + offs,
+             v.to(vpool_ptr.dtype.element_ty),
+             mask=tl.full([D], 1, tl.int1) & valid)
 
 
 class _DragonTokenShiftState(nn.Module, MambaBase):
@@ -339,20 +407,15 @@ class DragonDiffTPAAttention(nn.Module):
         """
         alpha_k_all, _ = self.shift_proj_k(hidden_states)
         alpha_v_all, _ = self.shift_proj_v(hidden_states)
-        alpha_k = torch.sigmoid(alpha_k_all.float())
-        alpha_v = torch.sigmoid(alpha_v_all.float())
-        alpha_k = alpha_k.unsqueeze(-1).to(k.dtype)  # (N, Hkv_local, 1)
-        alpha_v = alpha_v.unsqueeze(-1).to(v.dtype)
 
         fwd_ctx = get_forward_context()
         attn_md = fwd_ctx.attn_metadata
         if attn_md is None:
             # profile / dry run — treat as pure new-sequence shift.
-            k_prev = torch.zeros_like(k)
-            v_prev = torch.zeros_like(v)
-            k_shift = alpha_k * k_prev + (1 - alpha_k) * k
-            v_shift = alpha_v * v_prev + (1 - alpha_v) * v
-            return k_shift, v_shift
+            alpha_k = torch.sigmoid(alpha_k_all.float()).unsqueeze(-1).to(k.dtype)
+            return (1 - alpha_k) * k, (
+                1 - torch.sigmoid(alpha_v_all.float()).unsqueeze(-1).to(v.dtype)
+            ) * v
 
         md: DragonDiffTPAMetadata = attn_md[self.shift_state.prefix]
         k_pool, v_pool = self.shift_state.kv_cache
@@ -360,6 +423,52 @@ class DragonDiffTPAAttention(nn.Module):
         slots = md.state_indices_tensor
         nd, np_ = md.num_decodes, md.num_prefills
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
+
+        Dh = k.shape[-1]
+        fused = (
+            _FUSED_TOKEN_SHIFT
+            and k.is_cuda
+            and nd > 0
+            and (Dh & (Dh - 1)) == 0
+        )
+        if fused:
+            # Decode rows fully in one kernel: gather previous, sigmoid blend,
+            # store current into the pool (pad lanes skip the pool write).
+            k_shift = torch.empty_like(k)
+            v_shift = torch.empty_like(v)
+            Hkv = k.shape[1]
+            _token_shift_decode_kernel[(ndt * Hkv,)](
+                k, v, k_shift, v_shift, k_pool, v_pool,
+                alpha_k_all, alpha_v_all,
+                slots[:nd].to(torch.int32), positions,
+                Hkv, k_pool.shape[0],
+                k.stride(0), k.stride(1),
+                k_pool.stride(0), k_pool.stride(1),
+                alpha_k_all.stride(0),
+                D=Dh,
+            )
+            if np_ > 0:
+                kp, vp = self._prefill_prev_kv(
+                    md, k, v, slots, k_pool, v_pool, nd, np_, ndt, npt)
+                a_k = torch.sigmoid(
+                    alpha_k_all[ndt:ndt + npt].float()
+                ).unsqueeze(-1).to(k.dtype)
+                a_v = torch.sigmoid(
+                    alpha_v_all[ndt:ndt + npt].float()
+                ).unsqueeze(-1).to(v.dtype)
+                doc = (positions[ndt:ndt + npt] == 0).view(-1, 1, 1)
+                kp = kp.masked_fill(doc, 0)
+                vp = vp.masked_fill(doc, 0)
+                a_k = a_k.masked_fill(doc, 0)
+                a_v = a_v.masked_fill(doc, 0)
+                k_shift[ndt:ndt + npt] = a_k * kp + (1 - a_k) * k[ndt:ndt + npt]
+                v_shift[ndt:ndt + npt] = a_v * vp + (1 - a_v) * v[ndt:ndt + npt]
+            return k_shift, v_shift
+
+        alpha_k = torch.sigmoid(alpha_k_all.float())
+        alpha_v = torch.sigmoid(alpha_v_all.float())
+        alpha_k = alpha_k.unsqueeze(-1).to(k.dtype)  # (N, Hkv_local, 1)
+        alpha_v = alpha_v.unsqueeze(-1).to(v.dtype)
 
         k_prev = torch.zeros_like(k)
         v_prev = torch.zeros_like(v)
@@ -374,43 +483,8 @@ class DragonDiffTPAAttention(nn.Module):
 
         # -- Prefill tokens: shift-within-chunk with cached seed. --------
         if np_ > 0:
-            pslots = slots[nd:nd + np_]
-            # Prefer the builder's CPU mirrors (no per-layer GPU sync).
-            qsl_cpu = getattr(md, "query_start_loc_p_cpu", None)
-            qsl = (qsl_cpu if qsl_cpu is not None
-                   else md.query_start_loc_p).tolist()
-            has_init_cpu = getattr(md, "has_initial_state_cpu", None)
-            if has_init_cpu is None:
-                has_init_cpu = md.has_initial_state
-            has_init = (
-                has_init_cpu.tolist()
-                if has_init_cpu is not None
-                else [False] * np_
-            )
-            pslots_list = getattr(md, "state_indices_p_cpu", None)
-            if pslots_list is None:
-                pslots_list = pslots.tolist()  # fallback: one sync
-            k_pref = k[ndt:ndt + npt]
-            v_pref = v[ndt:ndt + npt]
-            kp = torch.empty_like(k_pref)
-            vp = torch.empty_like(v_pref)
-            for r in range(np_):
-                s, e = qsl[r], qsl[r + 1]
-                if e == s:
-                    continue
-                slot = int(pslots_list[r])
-                if has_init[r]:
-                    kp[s:s + 1] = k_pool[slot].to(k.dtype).unsqueeze(0)
-                    vp[s:s + 1] = v_pool[slot].to(v.dtype).unsqueeze(0)
-                else:
-                    kp[s:s + 1] = 0
-                    vp[s:s + 1] = 0
-                if e - s > 1:
-                    kp[s + 1:e] = k_pref[s:e - 1]
-                    vp[s + 1:e] = v_pref[s:e - 1]
-                # Cache this chunk's last raw K/V for the next chunk / decode.
-                k_pool[slot] = k_pref[e - 1].to(k_pool.dtype)
-                v_pool[slot] = v_pref[e - 1].to(v_pool.dtype)
+            kp, vp = self._prefill_prev_kv(
+                md, k, v, slots, k_pool, v_pool, nd, np_, ndt, npt)
             k_prev[ndt:ndt + npt] = kp
             v_prev[ndt:ndt + npt] = vp
 
@@ -424,3 +498,57 @@ class DragonDiffTPAAttention(nn.Module):
         k_shift = alpha_k * k_prev + (1 - alpha_k) * k
         v_shift = alpha_v * v_prev + (1 - alpha_v) * v
         return k_shift, v_shift
+
+    def _prefill_prev_kv(
+        self,
+        md: DragonDiffTPAMetadata,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        slots: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        nd: int,
+        np_: int,
+        ndt: int,
+        npt: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Previous-token K/V for prefill rows (shift-within-chunk with
+        cached seed); also stores each chunk's last raw K/V into the pools."""
+        pslots = slots[nd:nd + np_]
+        # Prefer the builder's CPU mirrors (no per-layer GPU sync).
+        qsl_cpu = getattr(md, "query_start_loc_p_cpu", None)
+        qsl = (qsl_cpu if qsl_cpu is not None
+               else md.query_start_loc_p).tolist()
+        has_init_cpu = getattr(md, "has_initial_state_cpu", None)
+        if has_init_cpu is None:
+            has_init_cpu = md.has_initial_state
+        has_init = (
+            has_init_cpu.tolist()
+            if has_init_cpu is not None
+            else [False] * np_
+        )
+        pslots_list = getattr(md, "state_indices_p_cpu", None)
+        if pslots_list is None:
+            pslots_list = pslots.tolist()  # fallback: one sync
+        k_pref = k[ndt:ndt + npt]
+        v_pref = v[ndt:ndt + npt]
+        kp = torch.empty_like(k_pref)
+        vp = torch.empty_like(v_pref)
+        for r in range(np_):
+            s, e = qsl[r], qsl[r + 1]
+            if e == s:
+                continue
+            slot = int(pslots_list[r])
+            if has_init[r]:
+                kp[s:s + 1] = k_pool[slot].to(k.dtype).unsqueeze(0)
+                vp[s:s + 1] = v_pool[slot].to(v.dtype).unsqueeze(0)
+            else:
+                kp[s:s + 1] = 0
+                vp[s:s + 1] = 0
+            if e - s > 1:
+                kp[s + 1:e] = k_pref[s:e - 1]
+                vp[s + 1:e] = v_pref[s:e - 1]
+            # Cache this chunk's last raw K/V for the next chunk / decode.
+            k_pool[slot] = k_pref[e - 1].to(k_pool.dtype)
+            v_pool[slot] = v_pref[e - 1].to(v_pool.dtype)
+        return kp, vp

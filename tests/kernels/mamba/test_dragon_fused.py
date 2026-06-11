@@ -118,3 +118,69 @@ def test_bc_norm_parity(n: int):
     # ops — agree within bf16 ULP.
     assert (out[:, 0].float() - rms_ref(b_r, wb)).abs().max().item() < 2e-2
     assert (out[:, 1].float() - rms_ref(c_r, wc)).abs().max().item() < 2e-2
+
+
+@requires_cuda
+@pytest.mark.parametrize("n,npad", [(1, 0), (16, 0), (8, 3), (64, 8)])
+def test_token_shift_decode_parity(n: int, npad: int):
+    """Fused decode token-shift vs the eager gather/blend/scatter chain,
+    incl. PAD_SLOT_ID lanes and a doc-start (position 0) row."""
+    from vllm.model_executor.layers.mamba.dragon_diff_tpa import (
+        _token_shift_decode_kernel,
+    )
+    torch.manual_seed(0)
+    dev = "cuda"
+    Hkv, Dh, P = 12, 128, 128
+    real = n - npad
+    slots = torch.randperm(P, device=dev)[:n].to(torch.int32)
+    slots[real:] = -1
+    k = torch.randn(n, Hkv, Dh, device=dev, dtype=torch.bfloat16)
+    v = torch.randn(n, Hkv, Dh, device=dev, dtype=torch.bfloat16)
+    ak = torch.randn(n, Hkv, device=dev, dtype=torch.bfloat16)
+    av = torch.randn(n, Hkv, device=dev, dtype=torch.bfloat16)
+    kp0 = torch.randn(P, Hkv, Dh, device=dev, dtype=torch.bfloat16)
+    vp0 = torch.randn(P, Hkv, Dh, device=dev, dtype=torch.bfloat16)
+    pos = torch.randint(1, 999, (n,), device=dev)
+    if real > 0:
+        pos[0] = 0  # doc start: shift disabled
+
+    # eager reference (fp32 blend to match the kernel's accumulation)
+    kpool_r, vpool_r = kp0.clone(), vp0.clone()
+    rs = slots[:real].long()
+    kprev = torch.zeros_like(k, dtype=torch.float32)
+    vprev = torch.zeros_like(v, dtype=torch.float32)
+    kprev[:real] = kpool_r[rs].float()
+    vprev[:real] = vpool_r[rs].float()
+    kpool_r[rs] = k[:real]
+    vpool_r[rs] = v[:real]
+    a_k = torch.sigmoid(ak.float()).unsqueeze(-1)
+    a_v = torch.sigmoid(av.float()).unsqueeze(-1)
+    doc = (pos == 0).view(-1, 1, 1)
+    kprev = kprev.masked_fill(doc, 0)
+    vprev = vprev.masked_fill(doc, 0)
+    a_k = a_k.masked_fill(doc, 0)
+    a_v = a_v.masked_fill(doc, 0)
+    ks_r = (a_k * kprev + (1 - a_k) * k.float()).to(torch.bfloat16)
+    vs_r = (a_v * vprev + (1 - a_v) * v.float()).to(torch.bfloat16)
+
+    # fused
+    kpool_f, vpool_f = kp0.clone(), vp0.clone()
+    ks_f = torch.empty_like(k)
+    vs_f = torch.empty_like(v)
+    _token_shift_decode_kernel[(n * Hkv,)](
+        k, v, ks_f, vs_f, kpool_f, vpool_f, ak, av, slots, pos, Hkv, P,
+        k.stride(0), k.stride(1), kpool_f.stride(0), kpool_f.stride(1),
+        ak.stride(0), D=Dh)
+    torch.cuda.synchronize()
+
+    # blended outputs: within 1 bf16 ULP (tl.sigmoid vs torch sigmoid)
+    assert (ks_f[:real].float() - ks_r[:real].float()).abs().max() <= 1e-2
+    assert (vs_f[:real].float() - vs_r[:real].float()).abs().max() <= 1e-2
+    # pool stores are bit-exact (raw current k/v, no arithmetic)
+    assert torch.equal(kpool_f, kpool_r)
+    assert torch.equal(vpool_f, vpool_r)
+    if npad:
+        # pad lanes blend against zero prev and leave the pools untouched
+        a_kp = torch.sigmoid(ak[real:].float()).unsqueeze(-1)
+        exp = ((1 - a_kp) * k[real:].float()).to(torch.bfloat16)
+        assert (ks_f[real:].float() - exp.float()).abs().max() <= 1e-2
