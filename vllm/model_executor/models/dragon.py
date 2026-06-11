@@ -717,12 +717,20 @@ class DragonModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
+            from_table = inputs_embeds is None
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             if self.config.normalize_embeddings_ngpt:
-                hidden_states = torch.nn.functional.normalize(hidden_states, dim=-1)
+                # Skipped for table-sourced tokens when the rows were
+                # pre-normalized at weight load (see load_weights); external
+                # inputs_embeds still normalize at runtime.
+                if not (from_table
+                        and getattr(self, "embeddings_prenormalized", False)):
+                    hidden_states = torch.nn.functional.normalize(
+                        hidden_states, dim=-1
+                    )
             if self.config.normalize_embeddings:
                 import math as _m
                 hidden_states = torch.nn.functional.normalize(
@@ -1047,6 +1055,25 @@ class DragonForCausalLM(
                     "Dragon load_weights: parameter %s not found, skipping.",
                     name,
                 )
+
+        # Fold the nGPT embedding normalization into the table: the lookup
+        # selects rows, so L2-normalizing the rows offline (fp32) is exactly
+        # equivalent to F.normalize after lookup — and slightly more precise
+        # than normalizing bf16 activations at runtime. Only valid when the
+        # lm_head is NOT tied to the embedding (normalizing would change the
+        # logits otherwise). The runtime normalize is then skipped for
+        # table-sourced tokens (inputs_embeds still normalizes — see forward).
+        if (
+            getattr(self.config, "normalize_embeddings_ngpt", False)
+            and not getattr(self.config, "tie_lm_head", False)
+            and not getattr(self.config, "tie_word_embeddings", False)
+        ):
+            w = self.model.embedding.weight
+            with torch.no_grad():
+                w.copy_(
+                    torch.nn.functional.normalize(w.float(), dim=-1).to(w.dtype)
+                )
+            self.model.embeddings_prenormalized = True
 
         return loaded
 

@@ -387,7 +387,9 @@ class DragonDiffTPAAttention(nn.Module):
                 if has_init_cpu is not None
                 else [False] * np_
             )
-            pslots_list = pslots.tolist()  # one sync for all requests
+            pslots_list = getattr(md, "state_indices_p_cpu", None)
+            if pslots_list is None:
+                pslots_list = pslots.tolist()  # fallback: one sync
             k_pref = k[ndt:ndt + npt]
             v_pref = v[ndt:ndt + npt]
             kp = torch.empty_like(k_pref)

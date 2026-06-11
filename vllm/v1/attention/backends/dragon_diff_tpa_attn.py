@@ -70,6 +70,7 @@ class DragonDiffTPAMetadata:
     # token-shift prefill path).
     has_initial_state_cpu: torch.Tensor | None = None
     query_start_loc_p_cpu: torch.Tensor | None = None
+    state_indices_p_cpu: list[int] | None = None
 
 
 class DragonDiffTPAMetadataBuilder(
@@ -119,15 +120,17 @@ class DragonDiffTPAMetadataBuilder(
         query_start_loc_p = None
         has_initial_state_cpu = None
         query_start_loc_p_cpu = None
+        state_indices_p_cpu = None
         if num_prefills > 0:
             context_lens = m.compute_num_computed_tokens()
             has_initial_state = context_lens[num_decodes:] > 0
             qsl = m.query_start_loc[num_decodes:]
             query_start_loc_p = qsl - qsl[0]
-            # One sync at build time instead of per V-layer downstream.
+            # Syncs at build time instead of per V-layer downstream.
             has_initial_state_cpu = has_initial_state.to("cpu")
             qsl_cpu = m.query_start_loc_cpu[num_decodes:]
             query_start_loc_p_cpu = qsl_cpu - qsl_cpu[0]
+            state_indices_p_cpu = state_indices_tensor[num_decodes:].tolist()
 
         return DragonDiffTPAMetadata(
             num_prefills=num_prefills,
@@ -140,4 +143,5 @@ class DragonDiffTPAMetadataBuilder(
             query_start_loc_p=query_start_loc_p,
             has_initial_state_cpu=has_initial_state_cpu,
             query_start_loc_p_cpu=query_start_loc_p_cpu,
+            state_indices_p_cpu=state_indices_p_cpu,
         )

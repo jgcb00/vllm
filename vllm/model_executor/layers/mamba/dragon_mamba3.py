@@ -41,18 +41,16 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadata
 
-# The TileLang varlen prefill kernel (``mamba3_mimo``) is ``@tilelang.jit``
-# compiled *specialized on S* (the total packed prefill-token count). In
-# serving, S = sum of prompt lengths in each scheduler step, which is
-# effectively random with variable-length prompts -> a fresh ~20-90s compile
-# on almost every prefill step (GPU idle), making evals run 100-1000x too slow.
-# Fix: pad the packed prefill up to the next multiple of this bucket so only a
-# handful of distinct S values are ever compiled; once compiled they are warm
-# (~0.1s) and persist in TileLang's on-disk cache across runs. A dummy trailing
-# segment absorbs the padding so the real per-sequence outputs/states are
-# unchanged. Override via DRAGON_PREFILL_BUCKET (0 disables bucketing).
+# Prefill-length bucketing (DEFAULT OFF). Historical: a local fork of the
+# TileLang varlen prefill kernel specialized on S (total packed token count),
+# so variable-length serving paid a fresh ~20-90s JIT compile per distinct S;
+# padding S up to a bucket multiple bounded the compile count. The upstream
+# kernel keeps S dynamic (one compile, no measurable perf difference vs
+# padded buckets — verified 2026-06-11), so padding is pure wasted compute
+# now. Set DRAGON_PREFILL_BUCKET=<n> to re-enable if running a static-S
+# kernel build.
 import os as _os
-_PREFILL_BUCKET = int(_os.environ.get("DRAGON_PREFILL_BUCKET", "512"))
+_PREFILL_BUCKET = int(_os.environ.get("DRAGON_PREFILL_BUCKET", "0"))
 
 # Decode-step state access. The default path passes the state pools + slot
 # indices straight into the CuteDSL step kernel (``state_indices=``), which
@@ -815,32 +813,6 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
         # computed once and cached (see _decode_const_weights).
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
 
-        # Under CUDA-graph batch padding, padded lanes carry PAD_SLOT_ID (-1).
-        # PyTorch advanced indexing wraps -1 to the LAST pool row, so a padded
-        # lane would clobber a live request's state. Redirect pad lanes to row
-        # 0 (vLLM's reserved null block) for all pool writes; reads of row -1
-        # only feed padded outputs, which are discarded.
-        slots_w = torch.where(slots >= 0, slots, torch.zeros_like(slots))
-
-        angle_state = angle_pool[slots]
-
-        C, B, nxt_angle = _apply_rotary_qk_inference_fwd(
-            q=C, k=B,
-            angle_state=angle_state,
-            angle_proj=angle,
-            dt=DT,
-            bias_q=bias_q, bias_k=bias_k,
-            conjugate=False, inplace=False, rotate_pairwise=False,
-        )
-
-        # Write the step kernel's output straight into ``out`` (it is a
-        # contiguous (N, H*D) slice) instead of a temp + final copy_.
-        y_is_out = (
-            not self._postgate_norm
-            and out.dtype == x.dtype
-            and out.is_contiguous()
-        )
-        y = out.view(out.shape[0], H, D) if y_is_out else torch.empty_like(x)
         use_indexed = (
             _INDEXED_STEP
             and ssm_pool.dtype in (torch.float32, torch.bfloat16)
@@ -850,6 +822,45 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
         # With tile_D >= headdim the indexed kernel also stores the new B/x
         # key/value states itself (one CTA per (b, h)) — skip those scatters.
         kernel_writes_kv = use_indexed and _STEP_TILE_D >= self.headdim
+        slots32 = slots.to(torch.int32)
+
+        if use_indexed:
+            # Rotary reads/updates angle_pool rows in place via slot indices
+            # (PAD_SLOT_ID lanes: q/k zeroed, pool untouched, kernel-side).
+            C, B, _ = _apply_rotary_qk_inference_fwd(
+                q=C, k=B,
+                angle_state=angle_pool,
+                angle_proj=angle,
+                dt=DT,
+                bias_q=bias_q, bias_k=bias_k,
+                conjugate=False, inplace=False, rotate_pairwise=False,
+                state_batch_indices=slots32,
+            )
+        else:
+            # Under CUDA-graph batch padding, padded lanes carry PAD_SLOT_ID
+            # (-1). PyTorch advanced indexing wraps -1 to the LAST pool row,
+            # so a padded lane would clobber a live request's state. Redirect
+            # pad lanes to row 0 (vLLM's reserved null block) for all pool
+            # writes; reads of row -1 only feed padded outputs (discarded).
+            slots_w = torch.where(slots >= 0, slots, torch.zeros_like(slots))
+            angle_state = angle_pool[slots]
+            C, B, nxt_angle = _apply_rotary_qk_inference_fwd(
+                q=C, k=B,
+                angle_state=angle_state,
+                angle_proj=angle,
+                dt=DT,
+                bias_q=bias_q, bias_k=bias_k,
+                conjugate=False, inplace=False, rotate_pairwise=False,
+            )
+
+        # Write the step kernel's output straight into ``out`` (it is a
+        # contiguous (N, H*D) slice) instead of a temp + final copy_.
+        y_is_out = (
+            not self._postgate_norm
+            and out.dtype == x.dtype
+            and out.is_contiguous()
+        )
+        y = out.view(out.shape[0], H, D) if y_is_out else torch.empty_like(x)
         if use_indexed:
             # Kernel reads/updates the pool rows directly via slot indices —
             # no gather/scatter round-trip on the 1.5 MB/seq fp32 SSM state.
@@ -870,11 +881,15 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 y,
                 z=z,
                 zproj=zpj,
-                state_batch_indices=slots.to(torch.int32),
+                state_batch_indices=slots32,
                 update_kv_state=kernel_writes_kv,
                 tile_D=_STEP_TILE_D,
                 num_warps=_STEP_NUM_WARPS,
             )
+            if not kernel_writes_kv:  # only if _STEP_TILE_D < headdim
+                slots_w = torch.where(slots >= 0, slots, torch.zeros_like(slots))
+                k_pool[slots_w] = B
+                v_pool[slots_w] = x
         else:
             ssm_state = ssm_pool[slots].to(torch.float32)
             k_state = k_pool[slots]
@@ -900,12 +915,12 @@ class DragonMamba3Mixer(nn.Module, MambaBase):
                 tile_D=_STEP_TILE_D,
                 num_warps=_STEP_NUM_WARPS,
             )
+            # New angle/B/x states for the next step. The kernels have
+            # already consumed the old pool rows. (The indexed path needs
+            # none of these scatters: rotary and step kernels write the
+            # pools in place.)
             ssm_pool[slots_w] = state_out
-
-        # New B/x states for the next step (cheap: ~55 KB/seq vs the 1.5 MB
-        # SSM state). The kernel has already consumed the old pool rows.
-        angle_pool[slots_w] = nxt_angle
-        if not kernel_writes_kv:
+            angle_pool[slots_w] = nxt_angle
             k_pool[slots_w] = B
             v_pool[slots_w] = x
 
