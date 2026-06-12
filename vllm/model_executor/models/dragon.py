@@ -406,7 +406,7 @@ class DragonGeodesicNorm(nn.Module):
                 g.stride(-2) if g.dim() > 1 else 0,
                 out.stride(-2) if out.dim() > 1 else 0,
                 BLOCK=triton.next_power_of_2(D),
-                num_warps=8,
+                num_warps=2,  # measured fastest at B=1 (1.56 us) and B=256
             )
             return out
         return self._forward_ref(x, g)
