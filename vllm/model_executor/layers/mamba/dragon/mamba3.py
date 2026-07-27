@@ -640,7 +640,14 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         # With tile_D >= headdim one CTA owns each (b, h) row, so the step
         # kernel can also store the new B/x key/value states itself.
         kernel_writes_kv = self.headdim <= _STEP_TILE_D
-        fuse_rotary = kernel_writes_kv and u.shape[0] <= _FUSE_ROTARY_MAX_BATCH
+        # The fused rotary reads B/C head-broadcast, which only holds for a
+        # single group. The kernel must also own the k_pool write, or the
+        # caller-side scatter below would store the pre-rotation B.
+        fuse_rotary = (
+            kernel_writes_kv
+            and self.ngroups == 1
+            and u.shape[0] <= _FUSE_ROTARY_MAX_BATCH
+        )
 
         if fuse_rotary:
             # No separate rotary launch: the step kernel applies bias+rotary to

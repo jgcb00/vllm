@@ -383,8 +383,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         if nd > 0 and head_dim & (head_dim - 1) == 0:
             # One kernel for the decode rows: gather previous, blend, store
             # current — replacing ~10 eager kernels per layer per step.
-            k_shift = torch.empty_like(k)
-            v_shift = torch.empty_like(v)
+            k_shift, v_shift = self._alloc_shift(k, v, ndt + npt)
             num_kv_heads = k.shape[1]
             _token_shift_decode_kernel[(ndt * num_kv_heads,)](
                 k,
@@ -426,8 +425,7 @@ class DragonDiffTPAAttention(PluggableLayer):
                 )
             return k_shift, v_shift
 
-        k_shift = torch.empty_like(k)
-        v_shift = torch.empty_like(v)
+        k_shift, v_shift = self._alloc_shift(k, v, ndt + npt)
         if nd > 0:
             dslots = slots[:nd]
             k_prev = k_pool[dslots].to(k.dtype)
@@ -463,6 +461,25 @@ class DragonDiffTPAAttention(PluggableLayer):
                 k_shift,
                 v_shift,
             )
+        return k_shift, v_shift
+
+    @staticmethod
+    def _alloc_shift(
+        k: torch.Tensor, v: torch.Tensor, num_covered: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Output buffers for the shift, with any uncovered tail passed through.
+
+        Decode and prefill rows between them normally cover the whole batch,
+        but a cudagraph-padded batch can carry trailing rows that neither
+        branch writes. Leaving those uninitialized would feed uninitialized
+        memory to attention, so copy the unshifted k/v into them; their
+        outputs are discarded either way.
+        """
+        k_shift = torch.empty_like(k)
+        v_shift = torch.empty_like(v)
+        if num_covered < k.shape[0]:
+            k_shift[num_covered:] = k[num_covered:]
+            v_shift[num_covered:] = v[num_covered:]
         return k_shift, v_shift
 
     @staticmethod
