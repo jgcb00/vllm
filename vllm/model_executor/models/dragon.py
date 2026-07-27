@@ -537,14 +537,14 @@ class DragonModel(nn.Module):
 
         self.embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
-        def build_block(block_prefix: str) -> DragonMonoBlock:
-            idx = int(block_prefix.rsplit(".", 1)[1])
+        def build_block(prefix: str) -> DragonMonoBlock:
+            idx = int(prefix.rsplit(".", 1)[1])
             return DragonMonoBlock(
                 config=config,
                 vllm_config=vllm_config,
                 layer_idx=idx,
                 layer_type=config.layers_config[idx],
-                prefix=block_prefix,
+                prefix=prefix,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -843,18 +843,31 @@ class DragonForCausalLM(
                     ):
                         # Dragon packs every expert into one tensor; scatter it
                         # into the fused w13/w2 parameters expert by expert.
+                        # NOTE: RoutedExperts.weight_loader dispatches on the
+                        # weight NAME ("weight" substring), so the target must
+                        # carry the real parameter name.
                         is_w1 = tail.endswith("experts.experts.weight")
                         param = expert_params[layer_idx][0 if is_w1 else 1]
                         shard_id = "w1" if is_w1 else "w2"
-                        target = f"{target_prefix}.experts.{shard_id}"
+                        target = (
+                            f"{target_prefix}.experts."
+                            f"{'w13_weight' if is_w1 else 'w2_weight'}"
+                        )
                         for expert_id in range(loaded_weight.shape[0]):
-                            param.weight_loader(
+                            success = param.weight_loader(
                                 param,
                                 loaded_weight[expert_id],
                                 target,
                                 shard_id=shard_id,
                                 expert_id=expert_id,
+                                return_success=True,
                             )
+                            if not success:
+                                raise RuntimeError(
+                                    f"Dragon load_weights: expert weight "
+                                    f"{target} (expert {expert_id}) was not "
+                                    f"accepted by the loader."
+                                )
                         loaded.add(target)
                         handled = True
                     elif tail == "expert_bias":
