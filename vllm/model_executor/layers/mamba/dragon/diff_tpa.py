@@ -189,7 +189,12 @@ class DragonDiffTPAAttention(PluggableLayer):
             else self.num_attention_heads // 2
         )
         self.num_noise_heads = self.num_attention_heads - self.num_signal_heads
-        assert self.num_signal_heads % self.num_noise_heads == 0
+        if self.num_noise_heads <= 0 or self.num_signal_heads % self.num_noise_heads:
+            raise ValueError(
+                f"DragonDiffTPAAttention: num_signal_heads="
+                f"{self.num_signal_heads} must be a positive multiple of "
+                f"num_noise_heads={self.num_noise_heads}"
+            )
         self.snr = self.num_signal_heads // self.num_noise_heads
         self.num_kv_heads = self.num_noise_heads
 

@@ -262,6 +262,9 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         self.D = nn.Parameter(torch.ones(self.nheads_local))
         set_weight_attrs(self.D, head_shard)
 
+        self._prefill_const_w: tuple[torch.Tensor, ...] | None = None
+        self._decode_const_w: tuple[torch.Tensor, ...] | None = None
+
         self._postgate_norm = getattr(config, "mamba3_postgate_norm", False)
         if self._postgate_norm:
             # Per-rank local-shard norm: each rank normalizes only its own
@@ -499,8 +502,9 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         DT = DT.permute(0, 2, 1).contiguous()  # (1, H, T)
 
         # Constant fp32 weight casts, computed once and cached (otherwise 6
-        # cast kernels + allocations per layer per prefill).
-        cw = getattr(self, "_prefill_const_w", None)
+        # cast kernels + allocations per layer per prefill). Invalidated by
+        # invalidate_weight_caches() on weight reload.
+        cw = self._prefill_const_w
         if cw is None:
             cw = (
                 self.C_bias.to(torch.float32),
@@ -548,14 +552,26 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         out.copy_(y.to(out.dtype))
 
     # -- Decode -------------------------------------------------------------
+    def invalidate_weight_caches(self) -> None:
+        """Drop the cached weight-derived tensors.
+
+        Must be called after any in-place weight reload: the caches mix live
+        views (the rearranged rotary biases) with snapshots (the fp32 casts
+        and contiguous copies), so running on stale caches after a reload
+        would silently blend old and new weights.
+        """
+        self._prefill_const_w = None
+        self._decode_const_w = None
+
     def _decode_const_weights(self):
         """Rearranged constant weights for the decode-step kernels.
 
-        The rotary biases and MIMO projections never change after weight
-        loading, so their per-step ``rearrange`` + ``.contiguous()`` copies are
-        pure redundant work (3 copy kernels per layer per step).
+        The rotary biases and MIMO projections never change between weight
+        loads, so their per-step ``rearrange`` + ``.contiguous()`` copies are
+        pure redundant work (3 copy kernels per layer per step). Invalidated
+        by invalidate_weight_caches() on weight reload.
         """
-        cw = getattr(self, "_decode_const_w", None)
+        cw = self._decode_const_w
         if cw is None:
             cw = (
                 rearrange(self.C_bias, "h r n -> r h n"),
