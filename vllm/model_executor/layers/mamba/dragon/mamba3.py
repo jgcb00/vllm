@@ -40,6 +40,12 @@ from vllm.model_executor.layers.mamba.dragon.state import (
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.mamba3_attn import Mamba3AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -61,6 +67,10 @@ _FUSE_ROTARY_MAX_BATCH = 64
 _mamba3_mimo = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
+# True when mamba3_mimo accepts Input_States (mamba_ssm mimo_input_state
+# merge): continuation prefills then run as one packed varlen call instead of
+# a serial per-token recurrence.
+_MIMO_SUPPORTS_INPUT_STATES = False
 
 
 def _is_pow2(n: int) -> bool:
@@ -69,8 +79,11 @@ def _is_pow2(n: int) -> bool:
 
 def _lazy_import_kernels() -> None:
     global _mamba3_mimo, _mamba3_step_fn, _apply_rotary_qk_inference_fwd
+    global _MIMO_SUPPORTS_INPUT_STATES
     if _mamba3_mimo is not None:
         return
+    import inspect
+
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
     from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo
     from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
@@ -80,6 +93,9 @@ def _lazy_import_kernels() -> None:
     _mamba3_mimo = mamba3_mimo
     _mamba3_step_fn = mamba3_step_fn
     _apply_rotary_qk_inference_fwd = apply_rotary_qk_inference_fwd
+    _MIMO_SUPPORTS_INPUT_STATES = (
+        "Input_States" in inspect.signature(mamba3_mimo).parameters
+    )
 
 
 @triton.jit
@@ -319,29 +335,34 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
 
     # -- Forward ------------------------------------------------------------
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """``(num_tokens, hidden_size)`` in, ``(num_tokens, d_inner/tp)`` out."""
+        """``(num_tokens, hidden_size)`` in, ``(num_tokens, d_inner/tp)`` out.
+
+        The state-dependent work runs outside the compiled graph as the
+        ``vllm::dragon_mamba3`` custom op, mirroring ``mamba_mixer2``.
+        """
+        out = torch.empty(
+            hidden_states.shape[0],
+            self.nheads_local * self.headdim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        torch.ops.vllm.dragon_mamba3(
+            hidden_states, out, _encode_layer_name(self.prefix)
+        )
+        return out
+
+    def _forward_impl(self, hidden_states: torch.Tensor, out: torch.Tensor) -> None:
         _lazy_import_kernels()
 
         attn_metadata = get_forward_context().attn_metadata
-        d_inner_local = self.nheads_local * self.headdim
         if attn_metadata is None:
             # Profiling / dry run.
-            return torch.zeros(
-                hidden_states.shape[0],
-                d_inner_local,
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
+            out.zero_()
+            return
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
         pools = self.kv_cache
         slots = md.state_indices_tensor
-        out = torch.empty(
-            hidden_states.shape[0],
-            d_inner_local,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
@@ -355,8 +376,6 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
                 md,
                 pools,
             )
-
-        return out
 
     # -- Projections --------------------------------------------------------
     def _project_in(self, h: torch.Tensor):
@@ -399,9 +418,19 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             self._prefill_zero_start(h, out, slots, md.query_start_loc_p, pools)
             return
 
-        # Mixed batch: the MIMO varlen kernel cannot be seeded with an initial
-        # state, so continuation chunks fall back to looping the decode step
-        # kernel token by token. Split the two groups and run each.
+        # Continuation chunks resume a cached state. With an Input_States-
+        # capable mamba3_mimo (mamba_ssm mimo_input_state), one packed varlen
+        # call still covers the whole batch: zero-start sequences get zero
+        # init states, continuations get their pool rows.
+        if _MIMO_SUPPORTS_INPUT_STATES:
+            init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
+            self._prefill_zero_start(
+                h, out, slots, md.query_start_loc_p, pools, init_states=init
+            )
+            return
+
+        # Legacy kernel: split zero-start sequences (one packed varlen call)
+        # from continuations (serial per-token recurrence).
         has_init = md.has_initial_state_cpu
         qsl_cpu = md.query_start_loc_p_cpu
         zero_idxs = [i for i in range(has_init.numel()) if not has_init[i]]
@@ -467,6 +496,32 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             )
             out.index_copy_(0, rows, step_out)
 
+    @staticmethod
+    def _gather_init_states(
+        pools: tuple[torch.Tensor, ...],
+        slots: torch.Tensor,
+        has_initial: torch.Tensor,  # (P,) bool, on device
+        compute_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-sequence init states for the varlen kernel.
+
+        Continuations read their pool rows; zero-start sequences get zeros
+        (masked on device — no CPU sync).
+        """
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        idx = slots.long()
+        mask1 = has_initial.view(-1, *([1] * (angle_pool.dim() - 1)))
+        angle = angle_pool[idx].to(torch.float32) * mask1
+        mask = has_initial.view(-1, *([1] * (ssm_pool.dim() - 1)))
+        ssm = ssm_pool[idx].to(torch.float32) * mask
+        k = k_pool[idx].to(compute_dtype) * has_initial.view(
+            -1, *([1] * (k_pool.dim() - 1))
+        )
+        v = v_pool[idx].to(compute_dtype) * has_initial.view(
+            -1, *([1] * (v_pool.dim() - 1))
+        )
+        return angle, ssm, k, v
+
     def _prefill_zero_start(
         self,
         h: torch.Tensor,  # (T, D)
@@ -474,6 +529,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         slots: torch.Tensor,  # (P,)
         qsl: torch.Tensor,  # (P+1,) rebased to 0
         pools: tuple[torch.Tensor, ...],
+        init_states: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
@@ -537,6 +593,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             dtype=x.dtype,
             return_state=True,
             cu_seqlens=qsl.to(torch.int32),
+            **({"Input_States": init_states} if init_states is not None else {}),
         )
 
         # The kernel's Final_V is taken at the global last token, which is
@@ -730,3 +787,29 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             if self._postgate_norm:
                 y = self.output_norm(y)
             out.copy_(y.to(out.dtype))
+
+
+def dragon_mamba3(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._forward_impl(hidden_states, output)
+
+
+def dragon_mamba3_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="dragon_mamba3",
+    op_func=dragon_mamba3,
+    mutates_args=["output"],
+    fake_impl=dragon_mamba3_fake,
+)

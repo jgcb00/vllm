@@ -42,6 +42,12 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.dragon_diff_tpa_attn import DragonDiffTPAMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
@@ -170,6 +176,14 @@ class DragonDiffTPAAttention(PluggableLayer):
         self.prefix = prefix
         tp = get_tensor_model_parallel_world_size()
         self.tp_size = tp
+        # Register under our own prefix so the vllm::dragon_diff_tpa custom op
+        # can resolve this layer from the forward context. Distinct from the
+        # nested Attention (.attn) and DragonTokenShiftState (.shift_state)
+        # registrations.
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
 
         for flag in ("token_conv1d_attn", "xsa", "intra_doc_masking"):
             if getattr(config, flag, False):
@@ -304,7 +318,29 @@ class DragonDiffTPAAttention(PluggableLayer):
         positions: torch.Tensor,  # (N,)
         hidden_states: torch.Tensor,  # (N, D)
     ) -> torch.Tensor:
-        """Return the differential output, ``(N, num_signal_heads_local*D)``."""
+        """Return the differential output, ``(N, num_signal_heads_local*D)``.
+
+        Runs outside the compiled graph as the ``vllm::dragon_diff_tpa``
+        custom op: the token shift mutates paged state, and the inner paged
+        attention is itself an out-of-graph op.
+        """
+        out = torch.empty(
+            hidden_states.shape[0],
+            self.num_signal_heads_local * self.head_dim,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        torch.ops.vllm.dragon_diff_tpa(
+            positions, hidden_states, out, _encode_layer_name(self.prefix)
+        )
+        return out
+
+    def _forward_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
         n = hidden_states.shape[0]
 
         q_all, _ = self.c_q(hidden_states)
@@ -357,8 +393,8 @@ class DragonDiffTPAAttention(PluggableLayer):
 
         lam_all, _ = self.lambda_proj(hidden_states)
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
-        out = sig - torch.sigmoid(lam) * noi
-        return out.reshape(n, self.num_signal_heads_local * self.head_dim)
+        diff = sig - torch.sigmoid(lam) * noi
+        out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
 
     def _apply_token_shift(
         self,
@@ -565,3 +601,31 @@ class DragonDiffTPAAttention(PluggableLayer):
             alpha_v_all[rows],
             positions[rows],
         )
+
+
+def dragon_diff_tpa(
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._forward_impl(positions, hidden_states, output)
+
+
+def dragon_diff_tpa_fake(
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="dragon_diff_tpa",
+    op_func=dragon_diff_tpa,
+    mutates_args=["output"],
+    fake_impl=dragon_diff_tpa_fake,
+)

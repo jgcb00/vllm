@@ -33,6 +33,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -526,6 +527,14 @@ class DragonMonoBlock(nn.Module):
         return self.b * residual + self.a * y_mlp
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class DragonModel(nn.Module):
     """Token embedding, a stack of :class:`DragonMonoBlock`, optional norm."""
 
