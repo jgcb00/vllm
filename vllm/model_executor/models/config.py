@@ -867,28 +867,41 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
                 "V layers hold different numbers of recurrent state tensors."
             )
 
-        # The Mamba3 MIMO varlen prefill kernel cannot be seeded with an
-        # initial SSM state. When chunked prefill splits a prompt mid-sequence
-        # — routine once several requests fill the token budget — the
-        # continuation chunk falls back to a serial per-token recurrence, N
-        # tokens x Mamba layers of dependent kernel launches. Under
-        # concurrency that stalls the engine long enough to trip the
-        # server/client watchdog. Force whole-prompt prefill so every prompt
-        # takes the fast zero-start varlen path.
+        # Chunked prefill requires a mamba3 varlen kernel that can be seeded
+        # with an initial state (mamba_ssm's mimo_input_state merge). Without
+        # it, a continuation chunk falls back to a serial per-token
+        # recurrence — N tokens x Mamba layers of dependent launches — which
+        # stalls the engine under concurrency. Probe the installed kernel and
+        # force whole-prompt prefill only when it lacks the capability.
         scheduler_config = vllm_config.scheduler_config
         if scheduler_config is not None and scheduler_config.enable_chunked_prefill:
-            scheduler_config.enable_chunked_prefill = False
-            scheduler_config.long_prefill_token_threshold = 0
-            # A whole prompt must fit in one batch.
-            max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
-            if max_model_len > scheduler_config.max_num_batched_tokens:
-                scheduler_config.max_num_batched_tokens = max_model_len
-            logger.info(
-                "Dragon: disabling chunked prefill (the mamba3 varlen kernel "
-                "has no init-state continuation path). "
-                "max_num_batched_tokens=%d",
-                scheduler_config.max_num_batched_tokens,
-            )
+            try:
+                import inspect
+
+                from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo
+
+                has_input_states = (
+                    "Input_States" in inspect.signature(mamba3_mimo).parameters
+                )
+            except ImportError:
+                has_input_states = False
+            if has_input_states:
+                logger.info(
+                    "Dragon: chunked prefill enabled (mamba3_mimo supports "
+                    "Input_States)."
+                )
+            else:
+                scheduler_config.enable_chunked_prefill = False
+                scheduler_config.long_prefill_token_threshold = 0
+                # A whole prompt must fit in one batch.
+                max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+                if max_model_len > scheduler_config.max_num_batched_tokens:
+                    scheduler_config.max_num_batched_tokens = max_model_len
+                logger.info(
+                    "Dragon: disabling chunked prefill (installed mamba3_mimo "
+                    "has no init-state support). max_num_batched_tokens=%d",
+                    scheduler_config.max_num_batched_tokens,
+                )
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
