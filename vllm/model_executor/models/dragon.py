@@ -2,36 +2,33 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Dragon model for vLLM.
 
-Dragon is a hybrid model stack:
-    - ``M`` layers: ``DragonMamba3Mixer``  (SSM with 4 temporal states,
-      paged via vLLM's Mamba state manager through the MAMBA3 backend).
-    - ``V`` layers: ``DragonDiffTPAAttention``  (Differential TPA softmax
-      attention with paged KV + optional 1-token shift buffer via the
-      DRAGON_DIFF_TPA side-channel backend).
-    - MoE MLP: ``DragonLatentMoE`` (latent projection + 256-expert
-      ``SharedFusedMoE`` + shared expert), dense ``DragonMLP`` fallback.
+Dragon is a hybrid stack:
 
-This file wires those mixers into a native vLLM ``DragonForCausalLM`` that
-owns the paged KV / paged SSM state, the block residual / geodesic-norm
-residual path, and weight loading.
+* ``M`` layers — :class:`DragonMamba3Mixer`, an SSM with four temporal states
+  paged through the MAMBA3 backend.
+* ``V`` layers — :class:`DragonDiffTPAAttention`, differential tensor-product
+  softmax attention over paged KV, plus a one-token shift buffer paged through
+  the DRAGON_DIFF_TPA side-channel backend.
+* MLP — :class:`DragonLatentMoE` (latent projection, 256 routed experts, one
+  shared expert) or the dense :class:`DragonMLP`.
 
-Known fidelity gaps (flagged, not silently papered over):
-    - vLLM's default ``get_rope`` replaces Dragon's custom ``p-rope``.
-    - Per-layer sliding window, ``intra_doc_masking``, ``scalable_softmax``
-      path is wired but uses vLLM's softmax scale (scalable-softmax pre-
-      scales ``q``); sliding-window attention bounds the log_pos only,
-      the main SW mask still depends on vLLM's default.
-    - ``token_conv1d_attn``, ``xsa``, ``use_value_embedding`` not ported.
-    - TP is supported by row-splitting the head axis on the head-interleaved
-      projections. ``cosnet=True`` is not supported with tp > 1. The Mamba3
-      post-gate norm (when enabled) runs as a local per-rank shard norm,
-      which differs numerically from a global RMSNorm.
+Known fidelity gaps, flagged rather than papered over:
+
+* vLLM's ``get_rope`` stands in for Dragon's custom p-rope.
+* ``scalable_softmax`` pre-scales q but the softmax scale itself is vLLM's;
+  sliding-window bounds only the log position, not the attention mask.
+* ``token_conv1d_attn``, ``xsa``, ``use_value_embedding`` and ``cosnet`` are
+  not ported.
+* TP splits the head-interleaved projections on the head axis. The Mamba3
+  post-gate norm, when enabled, is a per-rank shard norm, which differs
+  numerically from a global RMSNorm.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from typing import Callable
+import math
+from collections.abc import Callable, Iterable
+from itertools import islice
 
 import torch
 from torch import nn
@@ -41,8 +38,8 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
     GateLinear,
-    SharedFusedMoE,
     activation_without_mul,
 )
 from vllm.model_executor.layers.linear import (
@@ -51,14 +48,14 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.dragon_diff_tpa import DragonDiffTPAAttention
-from vllm.model_executor.layers.mamba.dragon_mamba3 import (
+from vllm.model_executor.layers.mamba.dragon import (
+    DragonDiffTPAAttention,
     DragonMamba3Mixer,
-    _DragonNorm,
+    DragonNorm,
 )
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
+from vllm.model_executor.layers.mamba.dragon.state import (
+    mamba3_state_dtype,
+    mamba3_state_shape,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -83,72 +80,24 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-# Fused Triton geodesic-norm (DRAGON_FUSED_GEODESIC=0 to fall back to eager).
-import os as _os
-_FUSED_GEODESIC = _os.environ.get("DRAGON_FUSED_GEODESIC", "1") != "0"
-
-# --- optional per-component CUDA-event profiler (DRAGON_PROFILE=1) -----------
-_DPROF = bool(_os.environ.get("DRAGON_PROFILE"))
-if _DPROF:
-    import json as _json
-    import collections as _c
-    _ACC = _c.defaultdict(float)
-    _CNT = _c.defaultdict(int)
-    _PROF_OUT = _os.environ.get("DRAGON_PROFILE_OUT",
-                                "dragon_comp_prof.json")
-
-    def _timed(key, fn):
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record(); r = fn(); e.record(); e.synchronize()
-        _ACC[key] += s.elapsed_time(e); _CNT[key] += 1
-        return r
-
-    def _dump_prof():
-        with open(_PROF_OUT, "w") as f:
-            _json.dump({"ms": dict(_ACC), "count": dict(_CNT)}, f)
-else:
-    def _timed(key, fn):
-        return fn()
-
-    def _dump_prof():
-        pass
-
-
-# =============================================================================
-# MLP building blocks
-# =============================================================================
+SUPPORTED_LAYER_TYPES = frozenset({"M", "V"})
 
 
 class DragonMLP(nn.Module):
-    """Dense ReLU² MLP (``fc_1 → relu² → fc_2``), Dragon naming, TP-aware.
-
-    Used for the dense (non-MoE) layers. Checkpoint names match Dragon's
-    ``fc_1.weight`` / ``fc_2.weight``. TP splits ``fc_1`` column-wise and
-    ``fc_2`` row-wise, allreducing at the output.
-    """
+    """Dense ReLU² MLP (``fc_1 -> relu² -> fc_2``) in Dragon's naming."""
 
     def __init__(self, config, prefix: str = "", quant_config=None):
         super().__init__()
-        if get_tensor_model_parallel_world_size() > 1 and getattr(
-            config, "cosnet", False
-        ):
-            raise NotImplementedError(
-                "DragonMLP: cosnet=True is not supported with "
-                "tensor_parallel_size > 1."
-            )
-        hidden_size = config.hidden_size
-        intermediate = config.intermediate_size
         self.fc_1 = ColumnParallelLinear(
-            input_size=hidden_size,
-            output_size=intermediate,
+            input_size=config.hidden_size,
+            output_size=config.intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fc_1",
         )
         self.fc_2 = RowParallelLinear(
-            input_size=intermediate,
-            output_size=hidden_size,
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fc_2",
@@ -163,12 +112,11 @@ class DragonMLP(nn.Module):
 
 
 class DragonSharedMLP(nn.Module):
-    """Shared-expert ReLU² MLP, TP-aware.
+    """Shared-expert ReLU² MLP.
 
-    Used as the ``shared_experts`` submodule of ``DragonLatentMoE``. TP
-    splits ``up_proj`` column-wise and ``down_proj`` row-wise. Checkpoint
-    names (``fc_1`` / ``fc_2``) are remapped to ``up_proj`` / ``down_proj``
-    in ``load_weights``.
+    The checkpoint's ``fc_1``/``fc_2`` are remapped to ``up_proj``/``down_proj``
+    in :meth:`DragonForCausalLM.load_weights`. Results are not reduced here —
+    the MoE runner all-reduces the combined shared plus routed output once.
     """
 
     def __init__(
@@ -176,7 +124,6 @@ class DragonSharedMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         prefix: str = "",
-        reduce_results: bool = False,
         quant_config=None,
     ) -> None:
         super().__init__()
@@ -191,7 +138,7 @@ class DragonSharedMLP(nn.Module):
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=False,
-            reduce_results=reduce_results,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
@@ -205,22 +152,21 @@ class DragonSharedMLP(nn.Module):
 
 
 class DragonLatentMoE(nn.Module):
-    """vLLM-native replacement for Dragon's ``DragonMoE``.
+    """Latent MoE with sigmoid routing and non-gated ReLU² experts.
 
-    Latent (down-projected) MoE with sigmoid routing and a non-gated ReLU²
-    expert MLP, modelled on Nemotron-H's ``NemotronHMoE``. Differences from
-    Nemotron-H: flat top-k (no expert grouping) and a single shared expert.
+    Tokens are projected down to ``moe_routed_input_dim`` before the experts
+    and back up afterwards; the MoE runner owns both transforms, the routed
+    scaling factor, the shared-expert add and the all-reduce.
     """
 
-    def __init__(self, config, prefix: str = "", quant_config=None):
+    def __init__(self, config, parallel_config, prefix: str = "", quant_config=None):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.routed_scaling_factor = config.moe_routed_scaling_factor
         self.hidden_size = config.hidden_size
         self.latent_size = config.moe_routed_input_dim
         self.num_experts = config.moe_num_routed_experts
         self.top_k = config.moe_num_active_experts
-        assert self.latent_size, "DragonLatentMoE requires moe_routed_input_dim"
+        if not self.latent_size:
+            raise ValueError("DragonLatentMoE requires moe_routed_input_dim")
 
         self.gate = GateLinear(
             self.hidden_size,
@@ -233,6 +179,20 @@ class DragonLatentMoE(nn.Module):
             torch.empty(self.num_experts, dtype=torch.float32)
         )
 
+        shared_intermediate = config.moe_shared_intermediate_size
+        if shared_intermediate and shared_intermediate > 0:
+            self.shared_experts = DragonSharedMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=shared_intermediate,
+                prefix=f"{prefix}.shared_experts",
+                quant_config=quant_config,
+            )
+        else:
+            self.shared_experts = None
+
+        # Registered before `experts` so the latent projections keep their own
+        # parameter names: the runner holds the same module objects, and
+        # named_parameters reports whichever path it reaches first.
         self.fc1_latent_proj = ReplicatedLinear(
             input_size=self.hidden_size,
             output_size=self.latent_size,
@@ -248,32 +208,24 @@ class DragonLatentMoE(nn.Module):
             prefix=f"{prefix}.fc2_latent_proj",
         )
 
-        shared_intermediate = config.moe_shared_intermediate_size
-        if shared_intermediate and shared_intermediate > 0:
-            self.shared_experts = DragonSharedMLP(
-                hidden_size=self.hidden_size,
-                intermediate_size=shared_intermediate,
-                prefix=f"{prefix}.shared_experts",
-                reduce_results=False,
-                quant_config=quant_config,
-            )
-        else:
-            self.shared_experts = None
-
-        self.experts = SharedFusedMoE(
+        self.experts = FusedMoE(
             shared_experts=self.shared_experts,
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.latent_size,
             intermediate_size=config.moe_routed_intermediate_size,
-            reduce_results=False,
-            renormalize=(self.top_k > 1),
+            renormalize=self.top_k > 1,
             use_grouped_topk=False,
             scoring_func="sigmoid",
             e_score_correction_bias=self.gate.e_score_correction_bias,
             activation=activation_without_mul("relu2"),
-            is_act_and_mul=False,
             routed_input_transform=self.fc1_latent_proj,
+            routed_output_transform=self.fc2_latent_proj,
+            routed_scaling_factor=config.moe_routed_scaling_factor,
+            apply_routed_scale_to_output=True,
+            router_logits_dtype=self.gate.out_dtype,
+            enable_eplb=parallel_config.enable_eplb,
+            num_redundant_experts=parallel_config.eplb_config.num_redundant_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
@@ -281,33 +233,9 @@ class DragonLatentMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         hidden_states = x.reshape(-1, orig_shape[-1])
-
         router_logits, _ = self.gate(hidden_states)
-        shared_output, routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-
-        if hidden_states.dtype != torch.float16:
-            routed_output = routed_output * self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            shared_output = shared_output * (1.0 / self.routed_scaling_factor)
-
-        routed_output, _ = self.fc2_latent_proj(routed_output)
-
-        if self.shared_experts is not None:
-            out = routed_output + shared_output
-        else:
-            out = routed_output
-
-        if self.tp_size > 1:
-            out = self.experts.maybe_all_reduce_tensor_model_parallel(out)
-
+        out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return out.reshape(orig_shape)
-
-
-# =============================================================================
-# Geodesic residual update
-# =============================================================================
 
 
 @triton.jit
@@ -325,12 +253,12 @@ def _geodesic_norm_kernel(
     stride_o,
     BLOCK: tl.constexpr,
 ):
-    """Fused geodesic residual update — one program per token row.
+    """Fused geodesic residual update, one program per token row.
 
-    Single load of ``x``/``g``, fp32 reductions, single store; replaces the
-    ~15 small elementwise/reduction kernels of the eager reference (which
-    dominate decode launch/memory overhead at 2 calls/layer).
-    Uses ``‖g − c·x‖² = ‖g‖² − 2c(x·g) + c²‖x‖²`` to avoid a second pass.
+    A single load of ``x``/``g``, fp32 reductions and a single store replace
+    the ~15 small elementwise/reduction kernels of the eager reference, which
+    otherwise dominate decode launch overhead at two calls per layer. Uses
+    ``||g - c*x||² = ||g||² - 2c(x·g) + c²||x||²`` to avoid a second pass.
     """
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -342,11 +270,9 @@ def _geodesic_norm_kernel(
     xg = tl.sum(x * g, axis=0)
     gg = tl.sum(g * g, axis=0)
 
-    x_norm_sq = tl.maximum(xx, 1e-12)
-    coeff = xg / x_norm_sq
+    coeff = xg / tl.maximum(xx, 1e-12)
     tangent_sq = gg - 2.0 * coeff * xg + coeff * coeff * xx
-    tangent_norm = tl.sqrt(tl.maximum(tangent_sq, 0.0))
-    safe_tangent = tl.maximum(tangent_norm, 1e-8)
+    safe_tangent = tl.maximum(tl.sqrt(tl.maximum(tangent_sq, 0.0)), 1e-8)
     R = tl.sqrt(xx)
     safe_R = tl.maximum(R, 1e-6)
 
@@ -355,9 +281,7 @@ def _geodesic_norm_kernel(
     theta = tl.minimum(safe_tangent / safe_R, clamp_val)
     theta = tl.minimum((theta * scale + bias) * inv_depth, clamp_val)
 
-    cos_t = tl.cos(theta)
-    sin_t = tl.sin(theta)
-    out = x * cos_t + (g - coeff * x) * (safe_R * sin_t / safe_tangent)
+    out = x * tl.cos(theta) + (g - coeff * x) * (safe_R * tl.sin(theta) / safe_tangent)
     tl.store(
         out_ptr + row * stride_o + offs,
         out.to(out_ptr.dtype.element_ty),
@@ -366,18 +290,13 @@ def _geodesic_norm_kernel(
 
 
 class DragonGeodesicNorm(nn.Module):
-    """Geodesic residual update: port of Dragon's ``DragonGeodesicNorm``.
+    """Geodesic residual update, port of Dragon's ``DragonGeodesicNorm``.
 
-    Blends the residual ``x`` with the mixer / MLP output ``g`` along the
-    tangent direction on the hypersphere, bounded by a per-layer rotation
-    angle ``θ = clamp(safe_tangent_norm / R, self.clamp) * scale + bias``
-    then divided by ``layer_idx + 1``.
-
-    Checkpoint tensors: ``scale``, ``bias``, ``prosres_scalar`` (buffer).
-
-    The forward runs a fused Triton kernel (one launch instead of ~15 small
-    ops; fp32 intermediates instead of per-op bf16 rounding). Set
-    ``DRAGON_FUSED_GEODESIC=0`` to fall back to the eager reference.
+    Blends the residual ``x`` with the mixer/MLP output ``g`` along the tangent
+    direction on the hypersphere, bounded by a per-layer rotation angle
+    ``theta = clamp(tangent_norm / R) * scale + bias``, divided by
+    ``layer_idx + 1``. Checkpoint tensors: ``scale``, ``bias``, and the
+    ``prosres_scalar`` buffer.
     """
 
     def __init__(self, layer_idx: int):
@@ -389,37 +308,37 @@ class DragonGeodesicNorm(nn.Module):
         self.clamp = torch.pi / 4.0
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        if _FUSED_GEODESIC and x.is_cuda and x.stride(-1) == 1 and g.stride(-1) == 1:
-            out = torch.empty_like(x)
-            D = x.shape[-1]
-            n_rows = x.numel() // D
-            _geodesic_norm_kernel[(n_rows,)](
-                x,
-                g,
-                out,
-                self.scale,
-                self.bias,
-                1.0 / (self.layer_idx + 1),
-                self.clamp,
-                D,
-                x.stride(-2) if x.dim() > 1 else 0,
-                g.stride(-2) if g.dim() > 1 else 0,
-                out.stride(-2) if out.dim() > 1 else 0,
-                BLOCK=triton.next_power_of_2(D),
-                num_warps=2,  # measured fastest at B=1 (1.56 us) and B=256
-            )
-            return out
-        return self._forward_ref(x, g)
+        if not (x.is_cuda and x.stride(-1) == 1 and g.stride(-1) == 1):
+            return self.forward_native(x, g)
+        out = torch.empty_like(x)
+        D = x.shape[-1]
+        _geodesic_norm_kernel[(x.numel() // D,)](
+            x,
+            g,
+            out,
+            self.scale,
+            self.bias,
+            1.0 / (self.layer_idx + 1),
+            self.clamp,
+            D,
+            x.stride(-2) if x.dim() > 1 else 0,
+            g.stride(-2) if g.dim() > 1 else 0,
+            out.stride(-2) if out.dim() > 1 else 0,
+            BLOCK=triton.next_power_of_2(D),
+            num_warps=2,  # measured fastest at batch 1 (1.56 us) and batch 256
+        )
+        return out
 
-    def _forward_ref(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        """Eager reference. Kept as the non-CUDA path and the parity baseline."""
         x_norm_sq = x.square().sum(dim=-1, keepdim=True).clamp_min(1e-12)
         proj_coeff = (x * g).sum(dim=-1, keepdim=True) / x_norm_sq
         gradient = g - proj_coeff * x
-        tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True)
-        safe_tangent_norm = tangent_norm.clamp_min(1e-8)
+        safe_tangent_norm = torch.norm(gradient, p=2, dim=-1, keepdim=True).clamp_min(
+            1e-8
+        )
         unit_tangent = gradient / safe_tangent_norm
-        R = torch.norm(x, p=2, dim=-1, keepdim=True)
-        safe_R = R.clamp_min(1e-6)
+        safe_R = torch.norm(x, p=2, dim=-1, keepdim=True).clamp_min(1e-6)
         theta = (safe_tangent_norm / safe_R).clamp_max(self.clamp)
         theta = ((theta * self.scale + self.bias) / (self.layer_idx + 1)).clamp_max(
             self.clamp
@@ -427,21 +346,8 @@ class DragonGeodesicNorm(nn.Module):
         return x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
 
 
-# =============================================================================
-# Decoder block
-# =============================================================================
-
-
-_SUPPORTED_LAYER_TYPES = {"M", "V"}
-
-
 class DragonMonoBlock(nn.Module):
-    """Dragon single-mixer block (pre-norm, residual, gate, mixer_proj, MLP).
-
-    Supports layer types ``M`` (Mamba3 MIMO) and ``V`` (Differential-TPA);
-    other types from ``modeling_dragon.py`` (``g``, ``v``, ``w``, ``t``,
-    ``2``) would need their own ported mixers.
-    """
+    """Single-mixer block: pre-norm, mixer, optional gate, projection, MLP."""
 
     def __init__(
         self,
@@ -453,29 +359,28 @@ class DragonMonoBlock(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if layer_type not in _SUPPORTED_LAYER_TYPES:
+        if layer_type not in SUPPORTED_LAYER_TYPES:
             raise NotImplementedError(
-                f"DragonMonoBlock: layer type {layer_type!r} not ported yet "
-                f"(supported: {sorted(_SUPPORTED_LAYER_TYPES)})."
+                f"DragonMonoBlock: layer type {layer_type!r} is not ported "
+                f"(supported: {sorted(SUPPORTED_LAYER_TYPES)})."
             )
         self.config = config
         self.layer_idx = layer_idx
         self.layer_type = layer_type
-        # fp8 / quant only applies to the dense GEMMs (gate/output projections
-        # and the MLP/MoE). The mixers keep bf16: their projections feed the
-        # mamba3/rotary/DiffTPA kernels, which are numerically sensitive and
-        # have no fp8 path.
+        # Quantization applies only to the dense GEMMs — the block gate and
+        # output projections plus the MLP/MoE. The mixers stay bf16: their
+        # projections feed the mamba3/rotary/attention kernels, which are
+        # numerically sensitive and have no fp8 path.
         quant_config = vllm_config.quant_config
 
-        # --- Mixer -----------------------------------------------------------
         if layer_type == "M":
             self.mixer: nn.Module = DragonMamba3Mixer(
                 config, vllm_config=vllm_config, prefix=f"{prefix}.mixer"
             )
             head_dim = self.mixer.headdim
             num_heads = self.mixer.nheads
-            self.use_gate = False  # mamba3 has internal z-gate
-        else:  # "V"
+            self.use_gate = False  # mamba3 gates internally via z
+        else:
             self.mixer = DragonDiffTPAAttention(
                 config, vllm_config=vllm_config, prefix=f"{prefix}.mixer"
             )
@@ -487,31 +392,22 @@ class DragonMonoBlock(nn.Module):
         self.mixer_out_dim = head_dim * num_heads
 
         tp = get_tensor_model_parallel_world_size()
-        if tp > 1:
-            assert self.num_heads % tp == 0, (
-                f"DragonMonoBlock: num_heads={self.num_heads} not divisible "
-                f"by tp={tp}"
+        if self.num_heads % tp:
+            raise ValueError(
+                f"DragonMonoBlock: num_heads={self.num_heads} is not divisible "
+                f"by tensor_parallel_size={tp}"
             )
         self.num_heads_local = self.num_heads // tp
         self.mixer_out_dim_local = self.head_dim * self.num_heads_local
 
-        # --- Block-level gate (only for attention-like mixers) --------------
-        cosnet = getattr(config, "cosnet", False)
-        cosnet_rank = getattr(config, "cosnet_rank", 128)
-        if tp > 1 and cosnet:
-            raise NotImplementedError(
-                "DragonMonoBlock: cosnet=True is not supported with "
-                "tensor_parallel_size > 1."
-            )
         if self.use_gate:
-            gate_type = config.gate_type
-            if gate_type != "elementwise":
+            if config.gate_type != "elementwise":
                 raise NotImplementedError(
-                    f"DragonMonoBlock gate_type={gate_type!r} not ported "
-                    f"yet (only 'elementwise' is supported)."
+                    f"DragonMonoBlock: gate_type={config.gate_type!r} is not "
+                    f"ported (only 'elementwise' is supported)."
                 )
-            # Column-parallel on the output head axis so each rank produces
-            # its local ``(num_heads_local * head_dim)`` gate.
+            # Column-parallel on the output head axis, so each rank produces
+            # its own (num_heads_local * head_dim) gate.
             self.gate_proj = ColumnParallelLinear(
                 input_size=config.hidden_size,
                 output_size=self.mixer_out_dim,
@@ -529,12 +425,10 @@ class DragonMonoBlock(nn.Module):
                 self.gate_act = torch.sigmoid
             else:
                 raise NotImplementedError(
-                    f"DragonMonoBlock gate_act={config.gate_act!r} not ported."
+                    f"DragonMonoBlock: gate_act={config.gate_act!r} is not ported."
                 )
 
-        # --- Block-level output projection ----------------------------------
-        # Row-parallel: input is the sharded mixer output; each rank runs a
-        # partial matmul over its own head slice, then allreduces.
+        # Row-parallel: each rank matmuls its own head slice, then all-reduces.
         self.mixer_proj = RowParallelLinear(
             input_size=self.mixer_out_dim,
             output_size=config.hidden_size,
@@ -545,46 +439,42 @@ class DragonMonoBlock(nn.Module):
             prefix=f"{prefix}.mixer_proj",
         )
 
-        # --- Pre-norms / residual update ------------------------------------
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)
-        if config.geodesic_update:
+        self.is_geodesic = bool(config.geodesic_update)
+        if self.is_geodesic:
             self.input_norm: nn.Module = nn.Identity()
             self.postmixer_norm: nn.Module = nn.Identity()
             self.geodesic_mixer = DragonGeodesicNorm(layer_idx)
             self.geodesic_mlp = DragonGeodesicNorm(layer_idx)
         else:
-            self.input_norm = _DragonNorm(
+            self.input_norm = DragonNorm(config.hidden_size, eps=eps, zero_centered=zc)
+            self.postmixer_norm = DragonNorm(
                 config.hidden_size, eps=eps, zero_centered=zc
             )
-            self.postmixer_norm = _DragonNorm(
-                config.hidden_size, eps=eps, zero_centered=zc
-            )
-            self.geodesic_mixer = None
-            self.geodesic_mlp = None
 
-        # --- MLP ------------------------------------------------------------
         if config.moe:
             self.mlp: nn.Module = DragonLatentMoE(
-                config, prefix=f"{prefix}.mlp", quant_config=quant_config
+                config,
+                vllm_config.parallel_config,
+                prefix=f"{prefix}.mlp",
+                quant_config=quant_config,
             )
         else:
             if config.mlp_type != "simple":
                 raise NotImplementedError(
-                    f"DragonMonoBlock: non-MoE mlp_type={config.mlp_type!r} "
-                    "not ported (only 'simple' is supported)."
+                    f"DragonMonoBlock: mlp_type={config.mlp_type!r} is not "
+                    f"ported (only 'simple' is supported)."
                 )
             self.mlp = DragonMLP(
                 config, prefix=f"{prefix}.mlp", quant_config=quant_config
             )
 
-        # --- Residual scale ``a/b/lns`` -------------------------------------
-        import math as _math
-
-        lns = 1.0
-        if config.layer_norm_scaling:
-            lns = 1.0 / _math.sqrt(layer_idx + 1)
-        self.lns = float(lns)
+        # Residual scales. lns == 1.0 and the identity norms of geodesic mode
+        # would still launch a scalar-mul kernel per call — 72 wasted kernels
+        # per step across the stack — so the multiply is skipped when it is a
+        # no-op (see forward).
+        self.lns = 1.0 / math.sqrt(layer_idx + 1) if config.layer_norm_scaling else 1.0
         if config.use_completed_p:
             depth_ratio = len(config.layers_config) / config.base_depth
             self.a = float(depth_ratio ** (-config.completed_p_alpha))
@@ -592,16 +482,9 @@ class DragonMonoBlock(nn.Module):
             self.a = 1.0
         self.b = 1.0
 
-        self.is_geodesic = bool(config.geodesic_update)
-
-    # ------------------------------------------------------------------
-    def _mix(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor:
-        """Dispatch to the configured mixer. Input shape: ``(N, D)``."""
+    def _mix(self, hidden_states: torch.Tensor, positions: torch.Tensor):
         if self.layer_type == "M":
             return self.mixer(hidden_states)
-        # "V" — differential-TPA.
         return self.mixer(positions, hidden_states)
 
     def forward(
@@ -613,98 +496,74 @@ class DragonMonoBlock(nn.Module):
         """Flat-token forward: ``(N, D)`` in, ``(N, D)`` out."""
         n = hidden_states.shape[0]
 
-        # -- Mixer path -------------------------------------------------------
-        # lns == 1.0 (no layer_norm_scaling) and Identity norms (geodesic
-        # mode) would still launch a scalar-mul kernel + allocate per call —
-        # 72 wasted kernels/step across the stack. Skip the no-op multiply.
         residual = hidden_states
         x = self.input_norm(hidden_states)
         if self.lns != 1.0:
             x = self.lns * x
-        y_mix_flat = _timed(f"mixer_{self.layer_type}", lambda: self._mix(x, positions))  # (N, H_local*D)
+        y_mix = self._mix(x, positions)  # (N, H_local * D)
         if self.use_gate:
             g_all, _ = self.gate_proj(x)
-            g = g_all.view(n, self.num_heads_local, self.head_dim)
-            g = self.gate_act(g + self.gate_bias).to(y_mix_flat.dtype)
-            y_mix_flat = y_mix_flat.view(n, self.num_heads_local, self.head_dim)
-            y_mix_flat = y_mix_flat * g
-            y_mix_flat = y_mix_flat.reshape(n, self.mixer_out_dim_local)
-        y_mix, _ = self.mixer_proj(y_mix_flat)
+            g = self.gate_act(
+                g_all.view(n, self.num_heads_local, self.head_dim) + self.gate_bias
+            ).to(y_mix.dtype)
+            y_mix = (y_mix.view(n, self.num_heads_local, self.head_dim) * g).reshape(
+                n, self.mixer_out_dim_local
+            )
+        y_mix, _ = self.mixer_proj(y_mix)
 
         if self.is_geodesic:
-            hidden_states = _timed("geodesic", lambda: self.geodesic_mixer(residual, y_mix))
+            hidden_states = self.geodesic_mixer(residual, y_mix)
         else:
             hidden_states = self.b * residual + self.a * y_mix
 
-        # -- MLP path --------------------------------------------------------
         residual = hidden_states
         x = self.postmixer_norm(hidden_states)
         if self.lns != 1.0:
             x = self.lns * x
-        y_mlp = _timed("mlp/moe", lambda: self.mlp(x))
+        y_mlp = self.mlp(x)
         if self.is_geodesic:
-            hidden_states = _timed("geodesic", lambda: self.geodesic_mlp(residual, y_mlp))
-        else:
-            hidden_states = self.b * residual + self.a * y_mlp
-
-        return hidden_states
-
-
-# =============================================================================
-# Top-level model
-# =============================================================================
-
-
-def _iter_dragon_layers(
-    config,
-) -> Iterator[tuple[int, str]]:
-    """Yield ``(layer_idx, layer_type)`` for each block in ``layers_config``."""
-    for i, ch in enumerate(config.layers_config):
-        yield i, ch
+            return self.geodesic_mlp(residual, y_mlp)
+        return self.b * residual + self.a * y_mlp
 
 
 class DragonModel(nn.Module):
-    """Token embedding → stack of ``DragonMonoBlock`` → optional final norm."""
+    """Token embedding, a stack of :class:`DragonMonoBlock`, optional norm."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.embeddings_prenormalized = False
 
-        self.embedding = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        self.embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
-        def _make(prefix: str) -> DragonMonoBlock:
-            idx = int(prefix.rsplit(".", 1)[1])
-            layer_type = config.layers_config[idx]
+        def build_block(block_prefix: str) -> DragonMonoBlock:
+            idx = int(block_prefix.rsplit(".", 1)[1])
             return DragonMonoBlock(
                 config=config,
                 vllm_config=vllm_config,
                 layer_idx=idx,
-                layer_type=layer_type,
-                prefix=prefix,
+                layer_type=config.layers_config[idx],
+                prefix=block_prefix,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
-            len(config.layers_config), _make, prefix=f"{prefix}.layers"
+            len(config.layers_config), build_block, prefix=f"{prefix}.layers"
         )
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states"], config.hidden_size
-            )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size
         )
 
-        if config.final_norm and get_pp_group().is_last_rank:
-            eps = config.norm_epsilon
-            zc = getattr(config, "zero_centered_gamma", False)
-            self.final_norm: nn.Module = _DragonNorm(
-                config.hidden_size, eps=eps, zero_centered=zc
+        if not get_pp_group().is_last_rank:
+            self.final_norm: nn.Module = PPMissingLayer()
+        elif config.final_norm:
+            self.final_norm = DragonNorm(
+                config.hidden_size,
+                eps=config.norm_epsilon,
+                zero_centered=getattr(config, "zero_centered_gamma", False),
             )
         else:
-            self.final_norm = PPMissingLayer() if not get_pp_group().is_last_rank \
-                else nn.Identity()
+            self.final_norm = nn.Identity()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
@@ -718,68 +577,40 @@ class DragonModel(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             from_table = inputs_embeds is None
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-            if self.config.normalize_embeddings_ngpt:
-                # Skipped for table-sourced tokens when the rows were
-                # pre-normalized at weight load (see load_weights); external
-                # inputs_embeds still normalize at runtime.
-                if not (from_table
-                        and getattr(self, "embeddings_prenormalized", False)):
-                    hidden_states = torch.nn.functional.normalize(
-                        hidden_states, dim=-1
-                    )
+            hidden_states = (
+                self.embed_input_ids(input_ids) if from_table else inputs_embeds
+            )
+            if self.config.normalize_embeddings_ngpt and not (
+                from_table and self.embeddings_prenormalized
+            ):
+                # Table rows are pre-normalized at load time where possible;
+                # externally supplied embeddings still normalize here.
+                hidden_states = torch.nn.functional.normalize(hidden_states, dim=-1)
             if self.config.normalize_embeddings:
-                import math as _m
                 hidden_states = torch.nn.functional.normalize(
                     hidden_states, dim=-1
-                ) * _m.sqrt(self.config.hidden_size)
+                ) * math.sqrt(self.config.hidden_size)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        from itertools import islice
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions=positions, hidden_states=hidden_states)
 
-        if _DPROF:
-            _dump_prof()
-
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
-
-        if isinstance(self.final_norm, nn.Identity):
-            return hidden_states
         return self.final_norm(hidden_states)
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # DragonLatentMoE uses non-gated experts (only w1/w2), so only one
-        # ckpt→param mapping is needed per shard role. We remap the Dragon
-        # checkpoint ``experts.experts`` → FusedMoE's ``w1`` (up_proj stand-in)
-        # and ``experts.output_experts`` → ``w2`` explicitly in load_weights,
-        # so no SharedFusedMoE.make_expert_params_mapping is needed.
-        return []
 
+def moe_layer_indices(config) -> list[int]:
+    """Indices of the layers that carry a MoE MLP.
 
-# =============================================================================
-# CausalLM
-# =============================================================================
-
-
-def _moe_layer_indices(config) -> list[int]:
-    """Return the layer indices that have a MoE MLP.
-
-    Dragon's ``layers_mlp_config`` is ``''`` → all layers MoE (if
-    ``config.moe``) or all dense; otherwise it is a per-layer ``'m'``/``'d'``
-    string.
+    ``layers_mlp_config`` is either empty — every layer follows ``config.moe``
+    — or a per-layer ``'m'``/``'d'`` string.
     """
     if config.layers_mlp_config:
         return [i for i, c in enumerate(config.layers_mlp_config) if c == "m"]
-    return (
-        list(range(len(config.layers_config))) if config.moe else []
-    )
+    return list(range(len(config.layers_config))) if config.moe else []
 
 
 class DragonForCausalLM(
@@ -790,30 +621,27 @@ class DragonForCausalLM(
     SupportsPP,
     SupportsLoRA,
 ):
-    """vLLM-native Dragon causal LM with paged KV + paged SSM state."""
+    """Dragon causal LM with paged KV and paged recurrent state."""
 
-    # Dragon uses custom projection names (c_q / W_A_k / in_proj / in_proj_dyn
-    # / …), none of which map onto vLLM's default qkv_proj / gate_up_proj
-    # packing. Leave empty to disable the default packed-modules handling.
+    # Dragon's projection names (c_q / W_A_k / in_proj / in_proj_dyn / ...) do
+    # not map onto vLLM's qkv_proj / gate_up_proj packing, so the default
+    # packed-module handling is disabled.
     packed_modules_mapping: dict[str, list[str]] = {}
 
-    # LoRA-visible modules.
     embedding_modules = {
         "embedding": "input_embeddings",
         "lm_head": "output_embeddings",
     }
 
-    # ------------------------------------------------------------------
-    # MambaBase / hybrid state config surface
-    # ------------------------------------------------------------------
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[torch.dtype, ...]:
-        # Representative: the larger Mamba3 state (4 tensors).
-        return MambaStateDtypeCalculator.mamba3_state_dtype(
+        # Representative: the larger Mamba3 state.
+        return mamba3_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
     @classmethod
@@ -821,27 +649,39 @@ class DragonForCausalLM(
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, ...], ...]:
         hf_config = vllm_config.model_config.hf_config
-        parallel_config = vllm_config.parallel_config
         d_inner = 2 * hf_config.hidden_size
-        nheads = d_inner // hf_config.mamba_headdim
-        rope_fraction = 0.5
-        split = int(hf_config.mamba_d_state * rope_fraction)
+        split = int(hf_config.mamba_d_state * 0.5)  # rope_fraction
         if split % 2:
             split -= 1
-        num_rope_angles = split // 2
-        return MambaStateShapeCalculator.mamba3_state_shape(
-            tp_world_size=parallel_config.tensor_parallel_size,
-            num_heads=nheads,
+        return mamba3_state_shape(
+            tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
+            num_heads=d_inner // hf_config.mamba_headdim,
             head_dim=hf_config.mamba_headdim,
             d_state=hf_config.mamba_d_state,
             mimo_dim=hf_config.mamba_mimo_dim,
-            num_rope_angles=num_rope_angles,
+            num_rope_angles=split // 2,
         )
 
-    # ------------------------------------------------------------------
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple:
+        # Align mode assumes every mamba layer exposes the same number of
+        # state tensors; Dragon's M layers have four and its V layers two, so
+        # the single flat tuple this protocol expects cannot describe it.
+        # DragonForCausalLMConfig rejects --mamba-cache-mode align up front.
+        raise NotImplementedError(
+            "Dragon does not support mamba prefix caching (align mode): its M "
+            "and V layers hold different numbers of state tensors."
+        )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        if getattr(config, "cosnet", False):
+            # The CosNet sidecar branch is not ported; accepting the flag
+            # would silently drop a trained residual path.
+            raise NotImplementedError(
+                "DragonForCausalLM: config.cosnet is not supported."
+            )
         self.config = config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -866,32 +706,22 @@ class DragonForCausalLM(
             self.model.make_empty_intermediate_tensors
         )
 
-        # MixtureOfExperts bookkeeping.
+        self._init_moe_metadata()
+
+    def _init_moe_metadata(self) -> None:
+        """Populate the MixtureOfExperts bookkeeping surface."""
         self.expert_weights: list[object] = []
         self.moe_layers: list[nn.Module] = []
-        example_moe: DragonLatentMoE | None = None
+        example: DragonLatentMoE | None = None
         for layer in self.model.layers:
             if isinstance(layer, DragonMonoBlock) and isinstance(
                 layer.mlp, DragonLatentMoE
             ):
-                example_moe = layer.mlp
+                example = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
-        if example_moe is not None:
-            experts = example_moe.experts  # SharedFusedMoE
-            self.num_moe_layers = len(self.moe_layers)
-            self.num_expert_groups = 1
-            self.num_shared_experts = (
-                1 if example_moe.shared_experts is not None else 0
-            )
-            self.num_logical_experts = experts.logical_num_experts
-            self.num_physical_experts = experts.global_num_experts
-            self.num_local_physical_experts = experts.local_num_experts
-            self.num_routed_experts = experts.logical_num_experts
-            self.num_redundant_experts = (
-                experts.global_num_experts - experts.logical_num_experts
-            )
-        else:
-            self.num_moe_layers = 0
+
+        self.num_moe_layers = len(self.moe_layers)
+        if example is None:
             self.num_expert_groups = 0
             self.num_shared_experts = 0
             self.num_logical_experts = 0
@@ -899,8 +729,24 @@ class DragonForCausalLM(
             self.num_local_physical_experts = 0
             self.num_routed_experts = 0
             self.num_redundant_experts = 0
+            return
 
-    # ------------------------------------------------------------------
+        routed = example.experts.routed_experts
+        self.num_expert_groups = 1
+        self.num_shared_experts = 1 if example.shared_experts is not None else 0
+        self.num_logical_experts = example.num_experts
+        self.num_physical_experts = routed.global_num_experts
+        self.num_local_physical_experts = routed.local_num_experts
+        self.num_routed_experts = example.num_experts
+        self.num_redundant_experts = routed.global_num_experts - example.num_experts
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Dragon's experts are non-gated (w1/w2 only) and arrive packed in a
+        # single tensor per layer, which load_weights scatters directly. No
+        # checkpoint-name mapping applies, and an empty list keeps the generic
+        # machinery from picking up RoutedExperts' gated default.
+        return []
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -917,10 +763,7 @@ class DragonForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
     def update_physical_experts_metadata(
@@ -932,41 +775,51 @@ class DragonForCausalLM(
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts
-        for layer in self.model.layers:
+        for runner in self.moe_layers:
+            routed = runner.routed_experts
+            routed.local_num_experts = num_local_physical_experts
+            routed.global_num_experts = num_physical_experts
+            runner.update_expert_map()
+
+    def _expert_params(self) -> dict[int, tuple[nn.Parameter, nn.Parameter]]:
+        """Map layer index to that layer's packed ``(w13, w2)`` parameters.
+
+        Resolved by walking the modules rather than by name: the expert
+        weights live on the runner's ``RoutedExperts`` submodule, whose path
+        is an implementation detail of the MoE composition.
+        """
+        params: dict[int, tuple[nn.Parameter, nn.Parameter]] = {}
+        for idx, layer in enumerate(self.model.layers):
             if isinstance(layer, DragonMonoBlock) and isinstance(
                 layer.mlp, DragonLatentMoE
             ):
-                moe = layer.mlp.experts
-                moe.local_num_experts = num_local_physical_experts
-                moe.global_num_experts = num_physical_experts
-                moe.update_expert_map()
+                routed = layer.mlp.experts.routed_experts
+                params[idx] = (routed.w13_weight, routed.w2_weight)
+        return params
 
-    # ------------------------------------------------------------------
-    # Weight loading
-    # ------------------------------------------------------------------
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
         """Load a Dragon safetensors checkpoint.
 
-        Remaps:
-            - ``mlp.moe_gate.weight`` → ``mlp.gate.weight``
-            - ``mlp.down_proj.weight`` (latent down) → ``mlp.fc1_latent_proj.weight``
-            - ``mlp.up_proj.weight``   (latent up)   → ``mlp.fc2_latent_proj.weight``
-            - ``mlp.expert_bias``      → ``mlp.gate.e_score_correction_bias``
-            - ``mlp.shared_experts.fc_1/fc_2`` → ``shared_experts.up_proj/down_proj``
-            - ``mlp.experts.experts``  → FusedMoE ``w13`` (w1 shard)
-            - ``mlp.experts.output_experts`` → FusedMoE ``w2`` (w2 shard)
-            - ``mlp.tokens_per_expert`` — skipped (non-persistent buffer)
+        Remaps, for MoE layers:
+            ``mlp.moe_gate.weight``            -> ``mlp.gate.weight``
+            ``mlp.down_proj.weight``           -> ``mlp.fc1_latent_proj.weight``
+            ``mlp.up_proj.weight``             -> ``mlp.fc2_latent_proj.weight``
+            ``mlp.expert_bias``                -> ``mlp.gate.e_score_correction_bias``
+            ``mlp.shared_experts.fc_1/fc_2``   -> ``shared_experts.up_proj/down_proj``
+            ``mlp.experts.experts``            -> packed ``w13`` (w1 shard)
+            ``mlp.experts.output_experts``     -> packed ``w2``
+            ``mlp.tokens_per_expert``          -> dropped (non-persistent buffer)
         """
-        moe_layers = set(_moe_layer_indices(self.config))
-
+        moe_layers = set(moe_layer_indices(self.config))
+        expert_params = self._expert_params()
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         loaded: set[str] = set()
 
-        scalar_moe_remap = {
+        renames = {
             "moe_gate.weight": "gate.weight",
             "down_proj.weight": "fc1_latent_proj.weight",
             "up_proj.weight": "fc2_latent_proj.weight",
@@ -975,7 +828,6 @@ class DragonForCausalLM(
         }
 
         for name, loaded_weight in weights:
-            # --- MoE-layer-scoped remaps ------------------------------------
             handled = False
             if name.startswith("model.layers.") and ".mlp." in name:
                 head, tail = name.split(".mlp.", 1)
@@ -984,26 +836,19 @@ class DragonForCausalLM(
                 except ValueError:
                     layer_idx = -1
                 if layer_idx in moe_layers:
-                    tgt_prefix = f"model.layers.{layer_idx}.mlp"
+                    target_prefix = f"model.layers.{layer_idx}.mlp"
                     if tail in (
                         "experts.experts.weight",
                         "experts.output_experts.weight",
                     ):
-                        # Shard per-expert weights into FusedMoE's packed
-                        # ``w13_weight`` / ``w2_weight`` parameters.
-                        shard_id = (
-                            "w1"
-                            if tail.endswith("experts.experts.weight")
-                            else "w2"
-                        )
-                        target = (
-                            f"{tgt_prefix}.experts."
-                            + ("w13_weight" if shard_id == "w1" else "w2_weight")
-                        )
-                        param = params_dict[target]
-                        weight_loader = param.weight_loader
+                        # Dragon packs every expert into one tensor; scatter it
+                        # into the fused w13/w2 parameters expert by expert.
+                        is_w1 = tail.endswith("experts.experts.weight")
+                        param = expert_params[layer_idx][0 if is_w1 else 1]
+                        shard_id = "w1" if is_w1 else "w2"
+                        target = f"{target_prefix}.experts.{shard_id}"
                         for expert_id in range(loaded_weight.shape[0]):
-                            weight_loader(
+                            param.weight_loader(
                                 param,
                                 loaded_weight[expert_id],
                                 target,
@@ -1013,15 +858,13 @@ class DragonForCausalLM(
                         loaded.add(target)
                         handled = True
                     elif tail == "expert_bias":
-                        target = f"{tgt_prefix}.gate.e_score_correction_bias"
+                        target = f"{target_prefix}.gate.e_score_correction_bias"
                         param = params_dict[target]
-                        param.data.copy_(
-                            loaded_weight.to(param.dtype).to(param.device)
-                        )
+                        param.data.copy_(loaded_weight.to(param.dtype).to(param.device))
                         loaded.add(target)
                         handled = True
-                    elif tail in scalar_moe_remap:
-                        target = f"{tgt_prefix}.{scalar_moe_remap[tail]}"
+                    elif tail in renames:
+                        target = f"{target_prefix}.{renames[tail]}"
                         param = params_dict[target]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
@@ -1030,20 +873,14 @@ class DragonForCausalLM(
                         loaded.add(target)
                         handled = True
                     elif tail == "tokens_per_expert":
-                        handled = True  # drop
-                    elif tail.startswith("shared_experts."):
-                        # Fall through to default-loader path under remapped name.
-                        pass
+                        handled = True  # non-persistent buffer, dropped
 
             if handled:
                 continue
 
-            # --- Default path ----------------------------------------------
             if name in params_dict:
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded.add(name)
             elif name in buffers_dict:
@@ -1052,30 +889,30 @@ class DragonForCausalLM(
                 loaded.add(name)
             else:
                 logger.warning_once(
-                    "Dragon load_weights: parameter %s not found, skipping.",
-                    name,
+                    "Dragon load_weights: parameter %s not found, skipping.", name
                 )
 
-        # Fold the nGPT embedding normalization into the table: the lookup
-        # selects rows, so L2-normalizing the rows offline (fp32) is exactly
-        # equivalent to F.normalize after lookup — and slightly more precise
-        # than normalizing bf16 activations at runtime. Only valid when the
-        # lm_head is NOT tied to the embedding (normalizing would change the
-        # logits otherwise). The runtime normalize is then skipped for
-        # table-sourced tokens (inputs_embeds still normalizes — see forward).
-        if (
-            getattr(self.config, "normalize_embeddings_ngpt", False)
-            and not getattr(self.config, "tie_lm_head", False)
-            and not getattr(self.config, "tie_word_embeddings", False)
-        ):
-            w = self.model.embedding.weight
-            with torch.no_grad():
-                w.copy_(
-                    torch.nn.functional.normalize(w.float(), dim=-1).to(w.dtype)
-                )
-            self.model.embeddings_prenormalized = True
-
+        self._maybe_prenormalize_embeddings()
         return loaded
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()
+    def _maybe_prenormalize_embeddings(self) -> None:
+        """Fold the nGPT embedding normalization into the table.
+
+        The lookup only selects rows, so L2-normalizing them offline in fp32 is
+        exactly equivalent to ``F.normalize`` after lookup — and slightly more
+        precise than normalizing bf16 activations every step. Only valid when
+        the lm_head is untied, since normalizing would otherwise change the
+        logits.
+        """
+        if not getattr(self.config, "normalize_embeddings_ngpt", False):
+            return
+        if getattr(self.config, "tie_lm_head", False) or getattr(
+            self.config, "tie_word_embeddings", False
+        ):
+            return
+        weight = self.model.embedding.weight
+        with torch.no_grad():
+            weight.copy_(
+                torch.nn.functional.normalize(weight.float(), dim=-1).to(weight.dtype)
+            )
+        self.model.embeddings_prenormalized = True

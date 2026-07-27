@@ -826,8 +826,74 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class DragonForCausalLMConfig(VerifyAndUpdateConfig):
+    """Reconcile Dragon's HF config with vLLM's hybrid-model assumptions."""
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+
+        # Dragon's config reports num_key_value_heads=0, which makes the
+        # hybrid attention/mamba page-size alignment mis-size the KV cache.
+        # The real DiffTPA value is the noise-head count.
+        num_signal = getattr(hf_config, "num_signal_heads_diff", 0) or (
+            hf_config.num_attention_heads // 2
+        )
+        num_kv_heads = hf_config.num_attention_heads - num_signal
+        hf_config.num_key_value_heads = num_kv_heads
+        model_config.model_arch_config.total_num_kv_heads = num_kv_heads
+        logger.info(
+            "Dragon: setting num_key_value_heads=%d (num_attention_heads - "
+            "num_signal_heads_diff)",
+            num_kv_heads,
+        )
+
+        # Surface the expert count under vLLM's canonical name so
+        # --enable-expert-parallel and the is_moe checks work.
+        if getattr(hf_config, "moe", False):
+            num_experts = int(getattr(hf_config, "moe_num_routed_experts", 0) or 0)
+            if num_experts > 0:
+                hf_config.num_experts = num_experts
+                model_config.model_arch_config.num_experts = num_experts
+
+        # Align mode pages mamba state for prefix caching and assumes every
+        # mamba layer exposes the same number of state tensors. Dragon's M
+        # layers hold four and its V layers two, so reject it explicitly
+        # rather than fail later inside the state-copy machinery.
+        if vllm_config.cache_config.mamba_cache_mode == "align":
+            raise ValueError(
+                "Dragon does not support --mamba-cache-mode align: its M and "
+                "V layers hold different numbers of recurrent state tensors."
+            )
+
+        # The Mamba3 MIMO varlen prefill kernel cannot be seeded with an
+        # initial SSM state. When chunked prefill splits a prompt mid-sequence
+        # — routine once several requests fill the token budget — the
+        # continuation chunk falls back to a serial per-token recurrence, N
+        # tokens x Mamba layers of dependent kernel launches. Under
+        # concurrency that stalls the engine long enough to trip the
+        # server/client watchdog. Force whole-prompt prefill so every prompt
+        # takes the fast zero-start varlen path.
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config is not None and scheduler_config.enable_chunked_prefill:
+            scheduler_config.enable_chunked_prefill = False
+            scheduler_config.long_prefill_token_threshold = 0
+            # A whole prompt must fit in one batch.
+            max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+            if max_model_len > scheduler_config.max_num_batched_tokens:
+                scheduler_config.max_num_batched_tokens = max_model_len
+            logger.info(
+                "Dragon: disabling chunked prefill (the mamba3 varlen kernel "
+                "has no init-state continuation path). "
+                "max_num_batched_tokens=%d",
+                scheduler_config.max_num_batched_tokens,
+            )
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
+    "DragonForCausalLM": DragonForCausalLMConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
