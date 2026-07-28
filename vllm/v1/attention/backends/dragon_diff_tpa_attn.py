@@ -26,6 +26,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.dragon_spec_utils import (
+    DragonSpecMetadata,
+    build_dragon_spec_metadata,
+)
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
@@ -71,6 +75,10 @@ class DragonDiffTPAMetadata:
     query_start_loc_p_cpu: torch.Tensor | None = None
     state_indices_p_cpu: list[int] | None = None
 
+    # Speculative decoding (verify batches, column-slot protocol). None when
+    # spec decode is off or the batch has no decode rows.
+    spec: DragonSpecMetadata | None = None
+
 
 class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadata]):
     # The shift itself is a single cudagraph-friendly kernel for pure decode
@@ -87,12 +95,26 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
     ):
         assert isinstance(kv_cache_spec, MambaSpec)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1)
+        spec_config = vllm_config.speculative_config
+        self.num_spec = (
+            spec_config.num_speculative_tokens if spec_config is not None else 0
+        )
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        # See Mamba3AttentionMetadataBuilder: the captured decode graph bakes
+        # column-0 slot addressing, which is wrong under spec decode.
+        if vllm_config.speculative_config is not None:
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> DragonDiffTPAMetadata:
         m = common_attn_metadata
@@ -105,8 +127,27 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
         )
         state_indices_tensor = block_table_tensor[:, 0]
 
+        spec_active = self.num_spec > 0 and num_accepted_tokens is not None
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(m, decode_threshold=1)
+            split_decodes_and_prefills(
+                m,
+                decode_threshold=(self.reorder_batch_threshold if spec_active else 1),
+                treat_short_extends_as_decodes=False,
+            )
+            if spec_active
+            else split_decodes_and_prefills(m, decode_threshold=1)
+        )
+
+        spec = (
+            build_dragon_spec_metadata(
+                m,
+                block_table_tensor,
+                num_decodes,
+                self.num_spec,
+                num_accepted_tokens,
+            )
+            if spec_active
+            else None
         )
 
         has_initial_state = None
@@ -136,4 +177,5 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
             has_initial_state_cpu=has_initial_state_cpu,
             query_start_loc_p_cpu=query_start_loc_p_cpu,
             state_indices_p_cpu=state_indices_p_cpu,
+            spec=spec,
         )

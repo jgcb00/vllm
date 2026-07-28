@@ -6,8 +6,9 @@ The mixer keeps four per-request temporal states (angle, ssm, k, v) and has no
 causal conv1d, so this metadata is much smaller than GDN's: a prefill/decode
 split, the state slot lookup, and the prefill query layout.
 
-Speculative decoding is not supported — the CuteDSL step kernel advances the
-state by exactly one token per request.
+Speculative decoding uses the column-slot protocol (see dragon_spec_utils):
+verify batches chain the dual-slot step kernel, one launch per draft
+position, leaving per-position states that next step's acceptance selects.
 """
 
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.dragon_spec_utils import (
+    DragonSpecMetadata,
+    build_dragon_spec_metadata,
 )
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
@@ -69,6 +74,10 @@ class Mamba3AttentionMetadata:
     has_initial_any: bool = False
     query_start_loc_p_cpu: torch.Tensor | None = None
 
+    # Speculative decoding (verify batches, column-slot protocol). None when
+    # spec decode is off or the batch has no decode rows.
+    spec: DragonSpecMetadata | None = None
+
 
 class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMetadata]):
     # The TileLang varlen prefill kernel is not cudagraph-capturable, so only
@@ -84,12 +93,27 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
     ):
         assert isinstance(kv_cache_spec, MambaSpec)
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1)
+        spec_config = vllm_config.speculative_config
+        self.num_spec = (
+            spec_config.num_speculative_tokens if spec_config is not None else 0
+        )
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        # The captured decode graph bakes the non-spec slot addressing
+        # (state in column 0); under spec decode the state column is dynamic,
+        # so replaying that graph would read the wrong slot.
+        if vllm_config.speculative_config is not None:
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> Mamba3AttentionMetadata:
         m = common_attn_metadata
@@ -102,8 +126,27 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
         )
         state_indices_tensor = block_table_tensor[:, 0]
 
+        spec_active = self.num_spec > 0 and num_accepted_tokens is not None
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(m, decode_threshold=1)
+            split_decodes_and_prefills(
+                m,
+                decode_threshold=(self.reorder_batch_threshold if spec_active else 1),
+                treat_short_extends_as_decodes=False,
+            )
+            if spec_active
+            else split_decodes_and_prefills(m, decode_threshold=1)
+        )
+
+        spec = (
+            build_dragon_spec_metadata(
+                m,
+                block_table_tensor,
+                num_decodes,
+                self.num_spec,
+                num_accepted_tokens,
+            )
+            if spec_active
+            else None
         )
 
         has_initial_state = None
@@ -134,4 +177,5 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             has_initial_state_cpu=has_initial_state_cpu,
             has_initial_any=has_initial_any,
             query_start_loc_p_cpu=query_start_loc_p_cpu,
+            spec=spec,
         )

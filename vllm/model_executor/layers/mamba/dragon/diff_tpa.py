@@ -420,6 +420,41 @@ class DragonDiffTPAAttention(PluggableLayer):
         nd, np_ = md.num_decodes, md.num_prefills
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
+        if md.spec is not None and nd > 0:
+            k_shift, v_shift = self._alloc_shift(k, v, ndt + npt)
+            self._shift_spec_rows(
+                md.spec,
+                k,
+                v,
+                k_pool,
+                v_pool,
+                alpha_k_all,
+                alpha_v_all,
+                positions,
+                k_shift,
+                v_shift,
+                ndt,
+            )
+            if np_ > 0:
+                self._shift_prefill_rows(
+                    md,
+                    k,
+                    v,
+                    slots,
+                    k_pool,
+                    v_pool,
+                    alpha_k_all,
+                    alpha_v_all,
+                    positions,
+                    nd,
+                    np_,
+                    ndt,
+                    npt,
+                    k_shift,
+                    v_shift,
+                )
+            return k_shift, v_shift
+
         head_dim = k.shape[-1]
         if nd > 0 and head_dim & (head_dim - 1) == 0:
             # One kernel for the decode rows: gather previous, blend, store
@@ -503,6 +538,58 @@ class DragonDiffTPAAttention(PluggableLayer):
                 v_shift,
             )
         return k_shift, v_shift
+
+    def _shift_spec_rows(
+        self,
+        spec,  # DragonSpecMetadata
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        alpha_k_all: torch.Tensor,
+        alpha_v_all: torch.Tensor,
+        positions: torch.Tensor,
+        k_shift: torch.Tensor,
+        v_shift: torch.Tensor,
+        ndt: int,
+    ) -> None:
+        """Token shift for spec-decode verify rows (column-slot protocol).
+
+        Previous K/V for a request's first token comes from the pool column
+        selected by last step's acceptance; later positions shift in-batch.
+        Every position's raw K/V is stored to its own column so next step's
+        acceptance picks the right one. Inactive (row, t) writes land on the
+        reserved null block row 0.
+        """
+        qsl = spec.query_start_loc_d
+        starts = qsl[:-1].long()
+        qlens = torch.diff(qsl)
+        rows = torch.arange(ndt, device=k.device)
+        prev_rows = (rows - 1).clamp_(min=0)
+        k_prev = k.index_select(0, prev_rows)
+        v_prev = v.index_select(0, prev_rows)
+        init = spec.initial_slots().long()
+        k_prev.index_copy_(0, starts, k_pool[init].to(k.dtype))
+        v_prev.index_copy_(0, starts, v_pool[init].to(v.dtype))
+        self._blend(
+            k_shift[:ndt],
+            v_shift[:ndt],
+            k[:ndt],
+            v[:ndt],
+            k_prev,
+            v_prev,
+            alpha_k_all[:ndt],
+            alpha_v_all[:ndt],
+            positions[:ndt],
+        )
+        # Store position t's raw K/V into column t.
+        T = spec.max_qlen
+        t_idx = torch.arange(T, device=k.device)
+        active = t_idx.unsqueeze(0) < qlens.unsqueeze(1)  # (nd, T)
+        dest = torch.where(active, spec.state_cols[:, :T].long(), 0).view(-1)
+        src = torch.where(active, starts.unsqueeze(1) + t_idx.unsqueeze(0), 0).view(-1)
+        k_pool[dest] = k.index_select(0, src).to(k_pool.dtype)
+        v_pool[dest] = v.index_select(0, src).to(v_pool.dtype)
 
     @staticmethod
     def _alloc_shift(

@@ -366,7 +366,12 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
-            self._decode(hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], pools)
+            if md.spec is not None:
+                self._decode_spec(hidden_states[:ndt], out[:ndt], md.spec, pools)
+            else:
+                self._decode(
+                    hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], pools
+                )
 
         if md.num_prefills > 0:
             self._prefill(
@@ -640,6 +645,125 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             self._decode_const_w = cw
         return cw
 
+    def _decode_spec(
+        self,
+        u: torch.Tensor,  # (ndt, D) — all decode tokens, ragged per request
+        out: torch.Tensor,  # (ndt, d_inner_local)
+        spec,  # DragonSpecMetadata
+        pools: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Speculative verify: chain the dual-slot step kernel over positions.
+
+        Position t of each request reads the state written by position t-1
+        (column t-1; for t = 0 the column selected by last step's acceptance)
+        and writes column t. Inactive lanes (requests with fewer tokens) get
+        slot -1: the kernel zeroes their output and suppresses every write.
+        Always uses the fused rotary (correct at any batch size) so the angle
+        pool follows the same column protocol.
+        """
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        H, D = self.nheads_local, self.headdim
+        R, S = self.mimo_dim, self.d_state
+        if not (self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)):
+            raise NotImplementedError(
+                "Dragon spec decode requires ngroups == 1 and power-of-two "
+                "headdim/d_state (the fused preamble shapes)."
+            )
+        assert self.headdim <= _STEP_TILE_D
+        ndt = u.shape[0]
+
+        # Preamble over every decode token at once (same kernels as _decode).
+        zxdt, _ = self.in_proj(u)
+        bc, _ = self.in_proj_dyn(u)
+        x = torch.empty(ndt, H, D, dtype=u.dtype, device=u.device)
+        z = torch.empty_like(x)
+        _A = torch.empty(ndt, H, dtype=torch.float32, device=u.device)
+        DT = torch.empty_like(_A)
+        trap = torch.empty_like(_A)
+        _decode_preamble_kernel[(ndt * H,)](
+            zxdt,
+            x,
+            z,
+            _A,
+            DT,
+            trap,
+            self.dt_bias,
+            self.A_floor,
+            H,
+            zxdt.stride(0),
+            D=D,
+        )
+        bn_cn = torch.empty(ndt, 2, R, S, dtype=u.dtype, device=u.device)
+        _bc_norm_kernel[(ndt * 2 * R,)](
+            bc,
+            bn_cn,
+            self.B_norm.norm.weight,
+            self.C_norm.norm.weight,
+            self.B_norm.norm.eps,
+            R * S,
+            R,
+            bc.stride(0),
+            ZERO_CENTERED=self.B_norm.norm.zero_centered,
+            S=S,
+        )
+        angle = bc[..., 2 * R * S :]
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
+
+        qsl = spec.query_start_loc_d
+        starts = qsl[:-1].long()
+        qlens = torch.diff(qsl)
+        cols = spec.state_cols.to(torch.int32)
+        in0 = spec.initial_slots().to(torch.int32)
+        neg1 = torch.full_like(in0, -1)
+        dummy = torch.full_like(starts, ndt)
+        # Extra dummy row absorbs inactive lanes' outputs.
+        y_pad = torch.zeros(ndt + 1, H, D, dtype=u.dtype, device=u.device)
+
+        for t in range(spec.max_qlen):
+            active = qlens > t
+            rows = torch.where(active, starts + t, starts)
+            src = in0 if t == 0 else cols[:, t - 1].contiguous()
+            in_t = torch.where(active, src, neg1)
+            out_t = torch.where(active, cols[:, t].contiguous(), neg1)
+            bpre = bn_cn.index_select(0, rows)
+            y_t = torch.empty(rows.shape[0], H, D, dtype=u.dtype, device=u.device)
+            _mamba3_step_fn(
+                ssm_pool,
+                k_pool,
+                v_pool,
+                _A.index_select(0, rows),
+                bpre[:, 0].unsqueeze(2).expand(-1, -1, H, -1).to(torch.bfloat16),
+                bpre[:, 1].unsqueeze(2).expand(-1, -1, H, -1).to(torch.bfloat16),
+                self.D,
+                x.index_select(0, rows),
+                DT.index_select(0, rows),
+                trap.index_select(0, rows),
+                xpj,
+                outpj,
+                None,
+                y_t,
+                z=z.index_select(0, rows),
+                zproj=zpj,
+                state_batch_indices=in_t,
+                state_batch_indices_out=out_t,
+                update_kv_state=True,
+                tile_D=_STEP_TILE_D,
+                num_warps=_STEP_NUM_WARPS,
+                rotary_dim=2 * self.num_rope_angles,
+                rotary_bias_q=bias_q,
+                rotary_bias_k=bias_k,
+                rotary_angle_proj=angle.index_select(0, rows)
+                .unsqueeze(-2)
+                .expand(-1, H, -1),
+                rotary_angle_state=angle_pool,
+            )
+            y_pad.index_copy_(0, torch.where(active, starts + t, dummy), y_t)
+
+        y = y_pad[:ndt].reshape(ndt, H * D)
+        if self._postgate_norm:
+            y = self.output_norm(y)
+        out.copy_(y.to(out.dtype))
+
     def _decode(
         self,
         u: torch.Tensor,  # (N, D)
@@ -708,7 +832,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         angle = angle.unsqueeze(-2).expand(-1, H, -1)
 
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
-        slots32 = slots.to(torch.int32)
+        slots32 = slots.to(torch.int32).contiguous()
 
         # With tile_D >= headdim one CTA owns each (b, h) row, so the step
         # kernel can also store the new B/x key/value states itself.
