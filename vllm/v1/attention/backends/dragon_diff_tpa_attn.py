@@ -100,13 +100,18 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # See Mamba3AttentionMetadataBuilder.num_accepted_buf.
+        self.num_accepted_buf = torch.ones(
+            vllm_config.scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
-        # See Mamba3AttentionMetadataBuilder: the captured decode graph bakes
-        # column-0 slot addressing, which is wrong under spec decode.
         if vllm_config.speculative_config is not None:
-            return AttentionCGSupport.NEVER
+            # See Mamba3AttentionMetadataBuilder.get_cudagraph_support.
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def build(
@@ -125,18 +130,21 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-        state_indices_tensor = block_table_tensor[:, 0]
+        state_indices_tensor = block_table_tensor[:, 0].contiguous()
 
-        spec_active = self.num_spec > 0 and num_accepted_tokens is not None
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                m,
-                decode_threshold=(self.reorder_batch_threshold if spec_active else 1),
-                treat_short_extends_as_decodes=False,
+        spec_active = self.num_spec > 0
+        if spec_active:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=self.reorder_batch_threshold,
+                    treat_short_extends_as_decodes=(m.is_prefilling is None),
+                )
             )
-            if spec_active
-            else split_decodes_and_prefills(m, decode_threshold=1)
-        )
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(m, decode_threshold=1)
+            )
 
         spec = (
             build_dragon_spec_metadata(
@@ -145,6 +153,7 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
                 num_decodes,
                 self.num_spec,
                 num_accepted_tokens,
+                self.num_accepted_buf,
             )
             if spec_active
             else None

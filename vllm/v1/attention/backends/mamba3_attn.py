@@ -98,14 +98,22 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             spec_config.num_speculative_tokens if spec_config is not None else 0
         )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Persistent acceptance buffer: captured verify graphs read the
+        # initial-state column from this address; build() refreshes the
+        # contents every step (1 = column 0, the fresh-request default).
+        self.num_accepted_buf = torch.ones(
+            vllm_config.scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=device,
+        )
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
-        # The captured decode graph bakes the non-spec slot addressing
-        # (state in column 0); under spec decode the state column is dynamic,
-        # so replaying that graph would read the wrong slot.
         if vllm_config.speculative_config is not None:
-            return AttentionCGSupport.NEVER
+            # Uniform-batch capture only: verify steps replay the dual-slot
+            # chain against persistent metadata buffers; ragged spec batches
+            # and prefills stay uncaptured.
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def build(
@@ -124,18 +132,23 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-        state_indices_tensor = block_table_tensor[:, 0]
+        state_indices_tensor = block_table_tensor[:, 0].contiguous()
 
-        spec_active = self.num_spec > 0 and num_accepted_tokens is not None
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                m,
-                decode_threshold=(self.reorder_batch_threshold if spec_active else 1),
-                treat_short_extends_as_decodes=False,
+        spec_active = self.num_spec > 0
+        if spec_active:
+            # is_prefilling is absent from dummy capture batches, which are
+            # pure uniform decodes anyway.
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=self.reorder_batch_threshold,
+                    treat_short_extends_as_decodes=(m.is_prefilling is None),
+                )
             )
-            if spec_active
-            else split_decodes_and_prefills(m, decode_threshold=1)
-        )
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(m, decode_threshold=1)
+            )
 
         spec = (
             build_dragon_spec_metadata(
@@ -144,6 +157,7 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
                 num_decodes,
                 self.num_spec,
                 num_accepted_tokens,
+                self.num_accepted_buf,
             )
             if spec_active
             else None
