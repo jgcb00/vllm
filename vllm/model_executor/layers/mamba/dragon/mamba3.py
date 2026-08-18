@@ -680,7 +680,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
 
         # Constant fp32 weight casts, computed once and cached (otherwise 6
         # cast kernels + allocations per layer per prefill). Invalidated by
-        # invalidate_weight_caches() on weight reload.
+        # refresh_weight_caches() on weight reload.
         cw = self._prefill_const_w
         if cw is None:
             cw = (
@@ -743,17 +743,61 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         out.copy_(y.to(out.dtype))
 
     # -- Decode -------------------------------------------------------------
-    def invalidate_weight_caches(self) -> None:
-        """Drop the cached weight-derived tensors.
+    def refresh_weight_caches(self) -> None:
+        """Refresh the cached weight-derived tensors after a weight reload.
 
         Must be called after any in-place weight reload: the caches mix live
         views (the rearranged rotary biases) with snapshots (the fp32 casts
         and contiguous copies), so running on stale caches after a reload
         would silently blend old and new weights.
+
+        The snapshots are refreshed IN PLACE rather than dropped. FULL-mode
+        CUDA graphs capture ``_decode`` (inside the ``dragon_mamba3`` op) and
+        bake the snapshot tensors' raw device addresses into every captured
+        decode graph. Dropping the cache frees those tensors; once the
+        caching allocator reuses or releases the segment, every subsequent
+        graph replay reads freed memory — stale weights at best, an illegal
+        memory access as soon as the block is recycled. This was observed
+        deterministically under RL training (verl), which reloads weights
+        before every rollout; serving never resyncs weights, which is why it
+        never triggered. Rewriting the same storage keeps the baked pointers
+        valid and propagates the new weights into the captured graphs.
+
+        The view entries (rearranged rotary biases) alias the params, which
+        ``load_weights`` updates in place, so they need no refresh.
+        ``torch.inference_mode()`` is required because the caches are
+        created during forward under inference mode, and in-place writes to
+        inference tensors are only legal inside it.
         """
-        self._prefill_const_w = None
-        self._decode_const_w = None
-        self._in_proj_cat_w = None
+        with torch.inference_mode():
+            cw = self._decode_const_w
+            if cw is not None:
+                # In this tree all five entries are .contiguous() snapshots
+                # (the CUDA step kernel needs contiguous fp32 biases too).
+                cw[0].copy_(rearrange(self.C_bias, "h r n -> r h n"))
+                cw[1].copy_(rearrange(self.B_bias, "h r n -> r h n"))
+                cw[2].copy_(rearrange(self.in_proj_mimo_x, "h r p -> r h p"))
+                cw[3].copy_(rearrange(self.in_proj_mimo_z, "h r p -> r h p"))
+                cw[4].copy_(rearrange(self.out_proj_mimo, "h r p -> r h p"))
+            pw = self._prefill_const_w
+            if pw is not None:
+                for dst, src in zip(
+                    pw,
+                    (
+                        self.C_bias,
+                        self.B_bias,
+                        self.in_proj_mimo_x,
+                        self.in_proj_mimo_z,
+                        self.out_proj_mimo,
+                        self.D,
+                    ),
+                ):
+                    dst.copy_(src)
+            w = self._in_proj_cat_w
+            if w is not None:
+                n1 = self.in_proj.weight.shape[0]
+                w[:n1].copy_(self.in_proj.weight)
+                w[n1:].copy_(self.in_proj_dyn.weight)
 
     def _decode_const_weights(self):
         """Rearranged constant weights for the decode-step kernels.
@@ -761,7 +805,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         The rotary biases and MIMO projections never change between weight
         loads, so their per-step ``rearrange`` + ``.contiguous()`` copies are
         pure redundant work (3 copy kernels per layer per step). Invalidated
-        by invalidate_weight_caches() on weight reload.
+        by refresh_weight_caches() on weight reload.
         """
         cw = self._decode_const_w
         if cw is None:

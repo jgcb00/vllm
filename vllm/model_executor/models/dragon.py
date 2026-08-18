@@ -1037,7 +1037,7 @@ class DragonForCausalLM(
         self._maybe_prenormalize_embeddings()
         for module in self.modules():
             if isinstance(module, DragonMamba3Mixer):
-                module.invalidate_weight_caches()
+                module.refresh_weight_caches()
         return loaded
 
     def _maybe_prenormalize_embeddings(self) -> None:
