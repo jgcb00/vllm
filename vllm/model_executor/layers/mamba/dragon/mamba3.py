@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -65,6 +66,7 @@ _FUSE_ROTARY_MAX_BATCH = 64
 # External Mamba3 kernels (from the official ``mamba_ssm`` package), imported
 # lazily so this module stays importable on hosts without them.
 _mamba3_mimo = None
+_mamba3_mimo_grouped = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
 # True when mamba3_mimo accepts Input_States (mamba_ssm mimo_input_state
@@ -78,8 +80,8 @@ def _is_pow2(n: int) -> bool:
 
 
 def _lazy_import_kernels() -> None:
-    global _mamba3_mimo, _mamba3_step_fn, _apply_rotary_qk_inference_fwd
-    global _MIMO_SUPPORTS_INPUT_STATES
+    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn
+    global _apply_rotary_qk_inference_fwd, _MIMO_SUPPORTS_INPUT_STATES
     if _mamba3_mimo is not None:
         return
     import inspect
@@ -96,6 +98,18 @@ def _lazy_import_kernels() -> None:
     _MIMO_SUPPORTS_INPUT_STATES = (
         "Input_States" in inspect.signature(mamba3_mimo).parameters
     )
+    # Group-parallel exact prefill (mamba_ssm mamba3-prefill-opt): splits long
+    # sequences into virtual groups for GPU occupancy — same math, ~1.4x on
+    # long prompts. Disable with DRAGON_GROUPED_PREFILL=0.
+    if os.environ.get("DRAGON_GROUPED_PREFILL", "1") != "0":
+        try:
+            from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import (
+                mamba3_mimo_varlen_grouped,
+            )
+
+            _mamba3_mimo_grouped = mamba3_mimo_varlen_grouped
+        except ImportError:
+            _mamba3_mimo_grouped = None
 
 
 @triton.jit
@@ -420,7 +434,10 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         # launch covers the batch. DragonForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
         if not md.has_initial_any:
-            self._prefill_zero_start(h, out, slots, md.query_start_loc_p, pools)
+            self._prefill_zero_start(
+                h, out, slots, md.query_start_loc_p, pools,
+                qsl_cpu=md.query_start_loc_p_cpu,
+            )
             return
 
         # Continuation chunks resume a cached state. With an Input_States-
@@ -430,7 +447,8 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         if _MIMO_SUPPORTS_INPUT_STATES:
             init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
             self._prefill_zero_start(
-                h, out, slots, md.query_start_loc_p, pools, init_states=init
+                h, out, slots, md.query_start_loc_p, pools, init_states=init,
+                qsl_cpu=md.query_start_loc_p_cpu,
             )
             return
 
@@ -535,6 +553,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         qsl: torch.Tensor,  # (P+1,) rebased to 0
         pools: tuple[torch.Tensor, ...],
         init_states: tuple[torch.Tensor, ...] | None = None,
+        qsl_cpu: torch.Tensor | None = None,
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
@@ -578,7 +597,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             self._prefill_const_w = cw
         q_bias, k_bias, mimo_v, mimo_z, mimo_out, d_f32 = cw
 
-        Out, Final_Angle, Final_SSM, Final_K, _ = _mamba3_mimo(
+        kernel_kwargs = dict(
             Q=C.contiguous().bfloat16(),
             K=B.contiguous().bfloat16(),
             V=x.contiguous().bfloat16(),
@@ -596,10 +615,23 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             chunk_size=self.chunk_size,
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
-            return_state=True,
             cu_seqlens=qsl.to(torch.int32),
-            **({"Input_States": init_states} if init_states is not None else {}),
         )
+        if _mamba3_mimo_grouped is not None:
+            # Group-parallel exact prefill: long sequences split into virtual
+            # groups (kernel occupancy), short ones take the single-pass path
+            # inside the wrapper. Same numerics either way.
+            Out, Final_Angle, Final_SSM, Final_K, _ = _mamba3_mimo_grouped(
+                **kernel_kwargs,
+                Input_States=init_states,
+                cu_seqlens_cpu=qsl_cpu,
+            )
+        else:
+            Out, Final_Angle, Final_SSM, Final_K, _ = _mamba3_mimo(
+                **kernel_kwargs,
+                return_state=True,
+                **({"Input_States": init_states} if init_states is not None else {}),
+            )
 
         # The kernel's Final_V is taken at the global last token, which is
         # wrong for a packed varlen batch — recompute it per sequence.
