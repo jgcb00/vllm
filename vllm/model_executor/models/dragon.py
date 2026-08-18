@@ -406,8 +406,15 @@ class DragonGeodesicNorm(nn.Module):
     def __init__(self, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.scale = nn.Parameter(torch.tensor(1.0))
-        self.bias = nn.Parameter(torch.tensor(0.0))
+        # 1-D ([1]) rather than 0-dim: matches the FSDP-compatible modeling
+        # code (FSDP rejects 0-dim params), so RL weight syncs can copy the
+        # trainer's [1]-shaped tensors in place (a 0-dim param cannot receive
+        # a [1] tensor: "output with shape [] doesn't match the broadcast
+        # shape [1]"). copy_ broadcasts 0-dim checkpoint tensors into [1], so
+        # loading legacy checkpoints still works. Numerically identical —
+        # only used as ``theta * scale + bias`` with theta (..., 1).
+        self.scale = nn.Parameter(torch.tensor([1.0]))
+        self.bias = nn.Parameter(torch.tensor([0.0]))
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi / 4.0
 
