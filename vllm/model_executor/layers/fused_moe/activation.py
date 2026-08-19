@@ -182,8 +182,7 @@ def apply_moe_activation(
     elif activation == MoEActivation.GELU_TANH_NO_MUL:
         output.copy_(F.gelu(input, approximate="tanh"))
     elif activation == MoEActivation.RELU2_NO_MUL:
-        F.relu(input, inplace=True)
-        torch.square(input, out=output)
+        torch.ops._C.relu_squared(output, input)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
