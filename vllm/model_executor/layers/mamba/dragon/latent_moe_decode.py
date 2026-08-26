@@ -19,9 +19,9 @@ specialize it away.
 import torch
 import torch.nn.functional as F
 
-from vllm import _custom_ops as ops
 from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -29,6 +29,32 @@ from vllm.utils.torch_utils import (
 )
 
 SMALL_BATCH_MAX_TOKENS = 16
+
+
+@triton.jit
+def _topk_sigmoid_kernel(
+    logits_ptr, bias_ptr, w_ptr, ids_ptr,
+    E: tl.constexpr, K: tl.constexpr,
+):
+    """sigmoid scores, top-k by (score + bias), weights = score / sum: the
+    semantics of _moe_C.topk_sigmoid(renormalize=True), one program per token."""
+    m = tl.program_id(0)
+    offs = tl.arange(0, E)
+    lg = tl.load(logits_ptr + m * E + offs)
+    s = 1.0 / (1.0 + tl.exp(-lg))
+    sb = s + tl.load(bias_ptr + offs)
+    tot = 0.0
+    for k in range(K):
+        mx = tl.max(sb, axis=0)
+        idx = tl.min(tl.where(sb == mx, offs, E), axis=0)
+        w = tl.sum(tl.where(offs == idx, s, 0.0), axis=0)
+        tl.store(ids_ptr + m * K + k, idx.to(tl.int32))
+        tl.store(w_ptr + m * K + k, w)
+        tot += w
+        sb = tl.where(offs == idx, float("-inf"), sb)
+    for k in range(K):
+        w = tl.load(w_ptr + m * K + k)
+        tl.store(w_ptr + m * K + k, w / tot)
 
 
 @triton.jit
@@ -135,10 +161,11 @@ def dragon_moe_small(
 
     topk_w = torch.empty(M, top_k, dtype=torch.float32, device=dev)
     topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    tei = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    ops.topk_sigmoid(topk_w, topk_ids, tei, router_logits, True, e_score_bias, 1.0)
+    _topk_sigmoid_kernel[(M,)](
+        router_logits, e_score_bias, topk_w, topk_ids, E=E, K=top_k, num_warps=1
+    )
 
-    x_in = F.linear(hidden, w_in)                 # [M, D1 + S]: latent | shared pre-act
+    x_in = decode_gemv(hidden, w_in)                 # [M, D1 + S]: latent | shared pre-act
     latent = x_in[:, :D1].contiguous()
     h = torch.empty(M * top_k, N1, dtype=hidden.dtype, device=dev)
     _latent_moe_up_kernel[(M * top_k, N1 // 16)](
@@ -153,7 +180,7 @@ def dragon_moe_small(
         part, x_in[:, D1:], cat, routed_scale, x_in.stride(0),
         D2=D2, S=S, BS=128, K=top_k, num_warps=1,
     )
-    return F.linear(cat, w_out)                    # shared + fc2(routed), one GEMV
+    return decode_gemv(cat, w_out)                    # shared + fc2(routed), one GEMV
 
 
 def _dragon_latent_moe(

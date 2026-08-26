@@ -27,6 +27,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -399,7 +400,11 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
     # -- Projections --------------------------------------------------------
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
-        zxdtAtrap, _ = self.in_proj(h)
+        if h.shape[0] == 1 and self.in_proj.bias is None:
+            # Single-token decode: streaming GEMVs beat cuBLAS's batch-1 floor.
+            zxdtAtrap = decode_gemv(h, self.in_proj.weight)
+        else:
+            zxdtAtrap, _ = self.in_proj(h)
         per_head = zxdtAtrap.view(h.shape[0], self.nheads_local, 2 * self.headdim + 3)
         z = per_head[..., 0 : self.headdim]
         x = per_head[..., self.headdim : 2 * self.headdim]
@@ -407,7 +412,10 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         A = per_head[..., 2 * self.headdim + 1]
         trap = per_head[..., 2 * self.headdim + 2]
 
-        bc, _ = self.in_proj_dyn(h)
+        if h.shape[0] == 1 and self.in_proj_dyn.bias is None:
+            bc = decode_gemv(h, self.in_proj_dyn.weight)
+        else:
+            bc, _ = self.in_proj_dyn(h)
         off = self.ngroups * self.mimo_dim * self.d_state
         B = rearrange(
             bc[..., :off], "n (G r s) -> n r G s", G=self.ngroups, r=self.mimo_dim

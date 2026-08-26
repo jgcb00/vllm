@@ -26,6 +26,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.linear import (
@@ -343,11 +344,20 @@ class DragonDiffTPAAttention(PluggableLayer):
     ) -> None:
         n = hidden_states.shape[0]
 
-        q_all, _ = self.c_q(hidden_states)
-        A_k_all, _ = self.W_A_k(hidden_states)
-        A_v_all, _ = self.W_A_v(hidden_states)
-        B_k_all, _ = self.W_B_k(hidden_states)
-        B_v_all, _ = self.W_B_v(hidden_states)
+        if n == 1:
+            # Single-token decode: the six input projections share one
+            # streaming GEMV over their concatenated weights.
+            allp = decode_gemv(hidden_states, self._decode_proj_weight())
+            q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = torch.split(
+                allp, self._decode_proj_sizes, dim=-1
+            )
+        else:
+            q_all, _ = self.c_q(hidden_states)
+            A_k_all, _ = self.W_A_k(hidden_states)
+            A_v_all, _ = self.W_A_v(hidden_states)
+            B_k_all, _ = self.W_B_k(hidden_states)
+            B_v_all, _ = self.W_B_v(hidden_states)
+            lam_all, _ = self.lambda_proj(hidden_states)
 
         q = q_all.view(n, self.num_attention_heads_local, self.head_dim)
         A_k = A_k_all.view(n, self.num_kv_heads_local, self.rank)
@@ -391,10 +401,25 @@ class DragonDiffTPAAttention(PluggableLayer):
         sig = attn_out[:, :, : self.snr, :]
         noi = attn_out[:, :, self.snr : self.snr + 1, :]
 
-        lam_all, _ = self.lambda_proj(hidden_states)
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
+
+    def _decode_proj_weight(self) -> torch.Tensor:
+        """Concatenated [c_q; W_A_k; W_A_v; W_B_k; W_B_v; lambda_proj] weights
+        for the single-token GEMV; built once, dropped by
+        invalidate_weight_caches() after an in-place weight reload."""
+        w = getattr(self, "_decode_proj_w", None)
+        if w is None:
+            mods = (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
+                    self.W_B_v, self.lambda_proj)
+            self._decode_proj_sizes = [m.weight.shape[0] for m in mods]
+            w = torch.cat([m.weight for m in mods], 0).contiguous()
+            self._decode_proj_w = w
+        return w
+
+    def invalidate_weight_caches(self) -> None:
+        self._decode_proj_w = None
 
     def _apply_token_shift(
         self,
