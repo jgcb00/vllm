@@ -46,10 +46,16 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if K % 128 != 0:
         return F.linear(x, weight)
     y = torch.empty(1, N, dtype=x.dtype, device=x.device)
-    bk = 256 if N >= 4096 else (512 if K % 512 == 0 else 128)
-    _gemv_m1_kernel[(triton.cdiv(N, 8),)](
-        x, weight, y, N, K, weight.stride(0),
-        BN=8, BK=bk, num_warps=2 if N >= 4096 else (4 if K <= 1536 else 8),
+    # HBM-streaming configs measured on GH200 (36 distinct weights, graphed):
+    # wide outputs like 8 rows/program; narrow outputs want more programs.
+    if N >= 4096:
+        bn, bk, nw = 8, 512, 4
+    elif K % 1024 == 0 and K >= 3072:
+        bn, bk, nw = 4, 1024, 8
+    else:
+        bn, bk, nw = 4, (512 if K % 512 == 0 else 128), 8
+    _gemv_m1_kernel[(triton.cdiv(N, bn),)](
+        x, weight, y, N, K, weight.stride(0), BN=bn, BK=bk, num_warps=nw,
     )
     return y
 

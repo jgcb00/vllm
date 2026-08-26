@@ -32,55 +32,58 @@ SMALL_BATCH_MAX_TOKENS = 16
 
 
 @triton.jit
-def _topk_sigmoid_kernel(
-    logits_ptr, bias_ptr, w_ptr, ids_ptr,
-    E: tl.constexpr, K: tl.constexpr,
-):
-    """sigmoid scores, top-k by (score + bias), weights = score / sum: the
-    semantics of _moe_C.topk_sigmoid(renormalize=True), one program per token."""
-    m = tl.program_id(0)
-    offs = tl.arange(0, E)
-    lg = tl.load(logits_ptr + m * E + offs)
-    s = 1.0 / (1.0 + tl.exp(-lg))
-    sb = s + tl.load(bias_ptr + offs)
-    tot = 0.0
-    for k in range(K):
-        mx = tl.max(sb, axis=0)
-        idx = tl.min(tl.where(sb == mx, offs, E), axis=0)
-        w = tl.sum(tl.where(offs == idx, s, 0.0), axis=0)
-        tl.store(ids_ptr + m * K + k, idx.to(tl.int32))
-        tl.store(w_ptr + m * K + k, w)
-        tot += w
-        sb = tl.where(offs == idx, float("-inf"), sb)
-    for k in range(K):
-        w = tl.load(w_ptr + m * K + k)
-        tl.store(w_ptr + m * K + k, w / tot)
-
-
-@triton.jit
 def _latent_moe_up_kernel(
-    x_ptr,      # [M, D] bf16 latent input
-    ids_ptr,    # [M*K] int32 expert ids
-    w1_ptr,     # [E, N, D] bf16
-    h_ptr,      # [M*K, N] bf16 out
+    x_ptr,       # [M, D] bf16 latent input
+    logits_ptr,  # [M, E] fp32 router logits
+    bias_ptr,    # [E] fp32 e_score_correction_bias
+    ids_ptr,     # [M*K] int32 out (written by the nb == 0 programs)
+    tw_ptr,      # [M*K] fp32 out routing weights (normalized)
+    w1_ptr,      # [E, N, D] bf16
+    h_ptr,       # [M*K, N] bf16 out
+    E: tl.constexpr,
     D: tl.constexpr,
     N: tl.constexpr,
     BN: tl.constexpr,
     BD: tl.constexpr,
     K: tl.constexpr,
 ):
+    """Expert up-projection + relu^2 for one (token, slot k, N-block).
+
+    The router top-k (sigmoid scores, ranked by score + bias, weights
+    normalized over the k winners — topk_sigmoid semantics) is recomputed by
+    every program from the 256 logits: cheaper than a separate launch. The
+    nb == 0 program of each (token, k) publishes the id and weight for the
+    down kernel."""
     pid = tl.program_id(0)  # m * K + k
     nb = tl.program_id(1)
     m = pid // K
-    e = tl.load(ids_ptr + pid).to(tl.int64)
+    k_slot = pid % K
+    offs_e = tl.arange(0, E)
+    sc = 1.0 / (1.0 + tl.exp(-tl.load(logits_ptr + m * E + offs_e)))
+    sb = sc + tl.load(bias_ptr + offs_e)
+    tot = 0.0
+    e = 0
+    wsel = 0.0
+    for kk in range(K):
+        mx = tl.max(sb, axis=0)
+        idx = tl.min(tl.where(sb == mx, offs_e, E), axis=0)
+        w = tl.sum(tl.where(offs_e == idx, sc, 0.0), axis=0)
+        tot += w
+        if kk == k_slot:
+            e = idx
+            wsel = w
+        sb = tl.where(offs_e == idx, float("-inf"), sb)
+    if nb == 0:
+        tl.store(ids_ptr + pid, e.to(tl.int32))
+        tl.store(tw_ptr + pid, wsel / tot)
+    e64 = e.to(tl.int64)
     offs_n = nb * BN + tl.arange(0, BN)
     acc = tl.zeros([BN], dtype=tl.float32)
     for d0 in range(0, D, BD):
         offs_d = d0 + tl.arange(0, BD)
         x = tl.load(x_ptr + m * D + offs_d).to(tl.float32)
-        w = tl.load(w1_ptr + e * N * D + offs_n[:, None] * D + offs_d[None, :])
+        w = tl.load(w1_ptr + e64 * N * D + offs_n[:, None] * D + offs_d[None, :])
         acc += tl.sum(w.to(tl.float32) * x[None, :], axis=1)
-    # Match the fused_moe path: bf16 intermediate, then relu^2.
     h = acc.to(tl.bfloat16).to(tl.float32)
     h = tl.maximum(h, 0.0)
     h = h * h
@@ -161,15 +164,13 @@ def dragon_moe_small(
 
     topk_w = torch.empty(M, top_k, dtype=torch.float32, device=dev)
     topk_ids = torch.empty(M, top_k, dtype=torch.int32, device=dev)
-    _topk_sigmoid_kernel[(M,)](
-        router_logits, e_score_bias, topk_w, topk_ids, E=E, K=top_k, num_warps=1
-    )
 
     x_in = decode_gemv(hidden, w_in)                 # [M, D1 + S]: latent | shared pre-act
     latent = x_in[:, :D1].contiguous()
     h = torch.empty(M * top_k, N1, dtype=hidden.dtype, device=dev)
     _latent_moe_up_kernel[(M * top_k, N1 // 16)](
-        latent, topk_ids, w13, h, D=D1, N=N1, BN=16, BD=64, K=top_k, num_warps=4
+        latent, router_logits, e_score_bias, topk_ids, topk_w, w13, h,
+        E=E, D=D1, N=N1, BN=16, BD=64, K=top_k, num_warps=4,
     )
     part = torch.empty(M * top_k, D2, dtype=torch.float32, device=dev)
     _latent_moe_down_partial_kernel[(M * top_k, D2 // 8)](

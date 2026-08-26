@@ -179,6 +179,50 @@ def _bc_norm_kernel(
     tl.store(out_ptr + pid * S + offs, (v * inv * w).to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _decode_preamble_bc_kernel(
+    zxdt_ptr, x_ptr, z_ptr, a_ptr, dt_ptr, trap_ptr, dt_bias_ptr, a_floor, H,
+    stride_zxdt,
+    bc_ptr, bn_cn_ptr, wb_ptr, wc_ptr, eps, off_c, R, stride_bc,
+    n_pre,  # number of preamble programs (= tokens * H); the rest do B/C norm
+    D: tl.constexpr,
+    S: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr,
+):
+    """_decode_preamble_kernel and _bc_norm_kernel in one launch: programs
+    [0, n_pre) run the per-(token, head) preamble, the rest the per-(token,
+    B/C, mimo-row) norm. Same math as the two kernels."""
+    pid = tl.program_id(0)
+    if pid < n_pre:
+        h = pid % H
+        base = zxdt_ptr + (pid // H) * stride_zxdt + h * (2 * D + 3)
+        offs = tl.arange(0, D)
+        tl.store(z_ptr + pid * D + offs, tl.load(base + offs))
+        tl.store(x_ptr + pid * D + offs, tl.load(base + D + offs))
+        dt = tl.load(base + 2 * D).to(tl.float32)
+        a = tl.load(base + 2 * D + 1).to(tl.float32)
+        trap = tl.load(base + 2 * D + 2).to(tl.float32)
+        sp_a = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        v = dt + tl.load(dt_bias_ptr + h).to(tl.float32)
+        sp_dt = tl.where(v > 20.0, v, tl.log(1.0 + tl.exp(v)))
+        tl.store(a_ptr + pid, tl.minimum(-sp_a, -a_floor))
+        tl.store(dt_ptr + pid, sp_dt)
+        tl.store(trap_ptr + pid, 1.0 / (1.0 + tl.exp(-trap)))
+    else:
+        q = pid - n_pre
+        j = q % (2 * R)
+        base_bc = bc_ptr + (q // (2 * R)) * stride_bc + (j % R) * S + (j // R) * off_c
+        offs_s = tl.arange(0, S)
+        vals = tl.load(base_bc + offs_s).to(tl.float32)
+        inv = 1.0 / tl.sqrt(tl.sum(vals * vals) / S + eps)
+        wb = tl.load(wb_ptr + offs_s).to(tl.float32)
+        wc = tl.load(wc_ptr + offs_s).to(tl.float32)
+        wsel = tl.where(j >= R, wc, wb)
+        if ZERO_CENTERED:
+            wsel = wsel + 1.0
+        tl.store(bn_cn_ptr + q * S + offs_s, (vals * inv * wsel).to(bn_cn_ptr.dtype.element_ty))
+
+
 class DragonMamba3Mixer(PluggableLayer, MambaBase):
     """Mamba3 MIMO mixer over vLLM's paged recurrent state.
 
@@ -398,6 +442,22 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             )
 
     # -- Projections --------------------------------------------------------
+    def _decode_preamble(self, zxdt, bc, n, H, D, R, S):
+        """x/z split + A/dt/trap activations + B/C norms, one launch."""
+        x = torch.empty(n, H, D, dtype=zxdt.dtype, device=zxdt.device)
+        z = torch.empty_like(x)
+        _A = torch.empty(n, H, dtype=torch.float32, device=zxdt.device)
+        DT = torch.empty_like(_A)
+        trap = torch.empty_like(_A)
+        bn_cn = torch.empty(n, 2, R, S, dtype=zxdt.dtype, device=zxdt.device)
+        _decode_preamble_bc_kernel[(n * H + n * 2 * R,)](
+            zxdt, x, z, _A, DT, trap, self.dt_bias, self.A_floor, H, zxdt.stride(0),
+            bc, bn_cn, self.B_norm.norm.weight, self.C_norm.norm.weight,
+            self.B_norm.norm.eps, R * S, R, bc.stride(0), n * H,
+            D=D, S=S, ZERO_CENTERED=self.B_norm.norm.zero_centered,
+        )
+        return x, z, _A, DT, trap, bn_cn
+
     def _decode_in_proj(self, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """in_proj / in_proj_dyn for decode rows; streaming GEMVs at batch 1."""
         if u.shape[0] == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None:
@@ -722,37 +782,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
 
         # Preamble over every decode token at once (same kernels as _decode).
         zxdt, bc = self._decode_in_proj(u)
-        x = torch.empty(ndt, H, D, dtype=u.dtype, device=u.device)
-        z = torch.empty_like(x)
-        _A = torch.empty(ndt, H, dtype=torch.float32, device=u.device)
-        DT = torch.empty_like(_A)
-        trap = torch.empty_like(_A)
-        _decode_preamble_kernel[(ndt * H,)](
-            zxdt,
-            x,
-            z,
-            _A,
-            DT,
-            trap,
-            self.dt_bias,
-            self.A_floor,
-            H,
-            zxdt.stride(0),
-            D=D,
-        )
-        bn_cn = torch.empty(ndt, 2, R, S, dtype=u.dtype, device=u.device)
-        _bc_norm_kernel[(ndt * 2 * R,)](
-            bc,
-            bn_cn,
-            self.B_norm.norm.weight,
-            self.C_norm.norm.weight,
-            self.B_norm.norm.eps,
-            R * S,
-            R,
-            bc.stride(0),
-            ZERO_CENTERED=self.B_norm.norm.zero_centered,
-            S=S,
-        )
+        x, z, _A, DT, trap, bn_cn = self._decode_preamble(zxdt, bc, ndt, H, D, R, S)
         angle = bc[..., 2 * R * S :]
         bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
 
@@ -830,37 +860,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         if fuse_preamble:
             zxdt, bc = self._decode_in_proj(u)
             n_tok = u.shape[0]
-            x = torch.empty(n_tok, H, D, dtype=u.dtype, device=u.device)
-            z = torch.empty_like(x)
-            _A = torch.empty(n_tok, H, dtype=torch.float32, device=u.device)
-            DT = torch.empty_like(_A)
-            trap = torch.empty_like(_A)
-            _decode_preamble_kernel[(n_tok * H,)](
-                zxdt,
-                x,
-                z,
-                _A,
-                DT,
-                trap,
-                self.dt_bias,
-                self.A_floor,
-                H,
-                zxdt.stride(0),
-                D=D,
-            )
-            bn_cn = torch.empty(n_tok, 2, R, S, dtype=u.dtype, device=u.device)
-            _bc_norm_kernel[(n_tok * 2 * R,)](
-                bc,
-                bn_cn,
-                self.B_norm.norm.weight,
-                self.C_norm.norm.weight,
-                self.B_norm.norm.eps,
-                R * S,
-                R,
-                bc.stride(0),
-                ZERO_CENTERED=self.B_norm.norm.zero_centered,
-                S=S,
-            )
+            x, z, _A, DT, trap, bn_cn = self._decode_preamble(zxdt, bc, n_tok, H, D, R, S)
             B = bn_cn[:, 0].unsqueeze(2).expand(-1, -1, H, -1)
             C = bn_cn[:, 1].unsqueeze(2).expand(-1, -1, H, -1)
             angle = bc[..., 2 * R * S :]
