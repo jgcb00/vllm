@@ -39,6 +39,7 @@ from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
+from vllm.model_executor.layers.mamba.dragon.decode_gemv import dragon_linear
 from vllm.model_executor.layers.mamba.dragon.latent_moe_decode import (
     SMALL_BATCH_MAX_TOKENS,
     dragon_moe_small,
@@ -544,6 +545,13 @@ class DragonMonoBlock(nn.Module):
         # would still launch a scalar-mul kernel per call — 72 wasted kernels
         # per step across the stack — so the multiply is skipped when it is a
         # no-op (see forward).
+        # Unquantized single-rank mixer_proj: opaque op with the batch-1
+        # streaming GEMV inside (see decode_gemv).
+        self._plain_mixer_proj = (
+            quant_config is None
+            and get_tensor_model_parallel_world_size() == 1
+            and self.mixer_proj.bias is None
+        )
         self.lns = 1.0 / math.sqrt(layer_idx + 1) if config.layer_norm_scaling else 1.0
         if config.use_completed_p:
             depth_ratio = len(config.layers_config) / config.base_depth
@@ -579,7 +587,10 @@ class DragonMonoBlock(nn.Module):
             y_mix = (y_mix.view(n, self.num_heads_local, self.head_dim) * g).reshape(
                 n, self.mixer_out_dim_local
             )
-        y_mix, _ = self.mixer_proj(y_mix)
+        if self._plain_mixer_proj:
+            y_mix = dragon_linear(y_mix, self.mixer_proj.weight)
+        else:
+            y_mix, _ = self.mixer_proj(y_mix)
 
         if self.is_geodesic:
             hidden_states = self.geodesic_mixer(residual, y_mix)

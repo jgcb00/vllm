@@ -398,6 +398,14 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             )
 
     # -- Projections --------------------------------------------------------
+    def _decode_in_proj(self, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """in_proj / in_proj_dyn for decode rows; streaming GEMVs at batch 1."""
+        if u.shape[0] == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None:
+            return decode_gemv(u, self.in_proj.weight), decode_gemv(u, self.in_proj_dyn.weight)
+        zxdt, _ = self.in_proj(u)
+        bc, _ = self.in_proj_dyn(u)
+        return zxdt, bc
+
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
         if h.shape[0] == 1 and self.in_proj.bias is None:
@@ -713,8 +721,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         ndt = u.shape[0]
 
         # Preamble over every decode token at once (same kernels as _decode).
-        zxdt, _ = self.in_proj(u)
-        bc, _ = self.in_proj_dyn(u)
+        zxdt, bc = self._decode_in_proj(u)
         x = torch.empty(ndt, H, D, dtype=u.dtype, device=u.device)
         z = torch.empty_like(x)
         _A = torch.empty(ndt, H, dtype=torch.float32, device=u.device)
@@ -821,8 +828,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         # to bf16 per op, so greedy output can differ within bf16 noise.
         fuse_preamble = self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)
         if fuse_preamble:
-            zxdt, _ = self.in_proj(u)
-            bc, _ = self.in_proj_dyn(u)
+            zxdt, bc = self._decode_in_proj(u)
             n_tok = u.shape[0]
             x = torch.empty(n_tok, H, D, dtype=u.dtype, device=u.device)
             z = torch.empty_like(x)

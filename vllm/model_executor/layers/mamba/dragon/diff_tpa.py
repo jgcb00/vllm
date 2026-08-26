@@ -348,9 +348,9 @@ class DragonDiffTPAAttention(PluggableLayer):
             # Single-token decode: the six input projections share one
             # streaming GEMV over their concatenated weights.
             allp = decode_gemv(hidden_states, self._decode_proj_weight())
-            q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = torch.split(
-                allp, self._decode_proj_sizes, dim=-1
-            )
+            parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
+            q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
+            shift_alphas = tuple(parts[6:]) if self.token_shift else None
         else:
             q_all, _ = self.c_q(hidden_states)
             A_k_all, _ = self.W_A_k(hidden_states)
@@ -358,6 +358,7 @@ class DragonDiffTPAAttention(PluggableLayer):
             B_k_all, _ = self.W_B_k(hidden_states)
             B_v_all, _ = self.W_B_v(hidden_states)
             lam_all, _ = self.lambda_proj(hidden_states)
+            shift_alphas = None
 
         q = q_all.view(n, self.num_attention_heads_local, self.head_dim)
         A_k = A_k_all.view(n, self.num_kv_heads_local, self.rank)
@@ -368,7 +369,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         v = torch.bmm(A_v, B_v).div_(self.rank)
 
         if self.token_shift:
-            k, v = self._apply_token_shift(hidden_states, positions, k, v)
+            k, v = self._apply_token_shift(hidden_states, positions, k, v, shift_alphas)
 
         if self.qk_norm:
             q = self.q_norm(q)
@@ -413,6 +414,8 @@ class DragonDiffTPAAttention(PluggableLayer):
         if w is None:
             mods = (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
                     self.W_B_v, self.lambda_proj)
+            if self.token_shift:
+                mods = mods + (self.shift_proj_k, self.shift_proj_v)
             self._decode_proj_sizes = [m.weight.shape[0] for m in mods]
             w = torch.cat([m.weight for m in mods], 0).contiguous()
             self._decode_proj_w = w
@@ -427,10 +430,14 @@ class DragonDiffTPAAttention(PluggableLayer):
         positions: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        alphas: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Mix the previous token's raw K/V into the current token."""
-        alpha_k_all, _ = self.shift_proj_k(hidden_states)
-        alpha_v_all, _ = self.shift_proj_v(hidden_states)
+        if alphas is not None:
+            alpha_k_all, alpha_v_all = alphas
+        else:
+            alpha_k_all, _ = self.shift_proj_k(hidden_states)
+            alpha_v_all, _ = self.shift_proj_v(hidden_states)
 
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
