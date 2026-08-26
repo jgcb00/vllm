@@ -61,12 +61,15 @@ def _latent_moe_up_kernel(
     offs_e = tl.arange(0, E)
     sc = 1.0 / (1.0 + tl.exp(-tl.load(logits_ptr + m * E + offs_e)))
     sb = sc + tl.load(bias_ptr + offs_e)
+    # Padded batch rows carry garbage/NaN logits; NaN never compares equal to
+    # the max, which would select index E and read past the expert weights.
+    sb = tl.where(sb != sb, float("-inf"), sb)
     tot = 0.0
     e = 0
     wsel = 0.0
     for kk in range(K):
         mx = tl.max(sb, axis=0)
-        idx = tl.min(tl.where(sb == mx, offs_e, E), axis=0)
+        idx = tl.minimum(tl.min(tl.where(sb == mx, offs_e, E), axis=0), E - 1)
         w = tl.sum(tl.where(offs_e == idx, sc, 0.0), axis=0)
         tot += w
         if kk == k_slot:

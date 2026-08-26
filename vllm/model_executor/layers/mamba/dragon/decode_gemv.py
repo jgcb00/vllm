@@ -11,11 +11,16 @@ GH200). For M > 1 the per-row loop re-reads the weight tile, so cuBLAS
 remains the better choice and ``decode_gemv`` falls back to F.linear.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+_DISABLED = os.environ.get("DRAGON_GEMV", "1") == "0"
 
 
 @triton.jit
@@ -40,7 +45,7 @@ def _gemv_m1_kernel(
 
 def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for ``x: (M, K)``, ``weight: (N, K)``; triton at M == 1."""
-    if x.shape[0] != 1 or not x.is_cuda or x.dtype != weight.dtype:
+    if x.shape[0] != 1 or not x.is_cuda or x.dtype != weight.dtype or _DISABLED:
         return F.linear(x, weight)
     N, K = weight.shape
     if K % 128 != 0:

@@ -20,6 +20,8 @@ and Dragon's custom p-rope (vLLM's ``get_rope`` is used instead).
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -344,7 +346,7 @@ class DragonDiffTPAAttention(PluggableLayer):
     ) -> None:
         n = hidden_states.shape[0]
 
-        if n == 1:
+        if n == 1 and os.environ.get("DRAGON_TPA_CONCAT", "1") != "0":
             # Single-token decode: the six input projections share one
             # streaming GEMV over their concatenated weights.
             allp = decode_gemv(hidden_states, self._decode_proj_weight())
