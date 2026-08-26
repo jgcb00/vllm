@@ -27,6 +27,7 @@ Known fidelity gaps, flagged rather than papered over:
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Iterable
 from itertools import islice
 
@@ -34,10 +35,15 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
+from vllm.model_executor.layers.mamba.dragon.latent_moe_decode import (
+    SMALL_BATCH_MAX_TOKENS,
+    dragon_moe_small,
+)
+from vllm.utils.torch_utils import _encode_layer_name
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -231,12 +237,75 @@ class DragonLatentMoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
+        # Small-batch (decode) path: two gather-GEMV kernels instead of the
+        # generic permute/grouped-gemm pipeline. Single GPU, unquantized only;
+        # DRAGON_MOE_SMALL=0 disables it.
+        self.routed_scaling_factor = float(config.moe_routed_scaling_factor)
+        self._small_w: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._small_path = (
+            self.shared_experts is not None
+            and quant_config is None
+            and get_tensor_model_parallel_world_size() == 1
+            and not parallel_config.enable_eplb
+            and os.environ.get("DRAGON_MOE_SMALL", "1") != "0"
+        )
+
+        # Registered like the mixers so the MoE call is one opaque custom op
+        # and the small/generic dispatch runs inside it (see forward_dispatch).
+        self.registry_name = f"{prefix}.latent_moe"
+        compilation = get_current_vllm_config().compilation_config
+        if self.registry_name in compilation.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {self.registry_name}")
+        compilation.static_forward_context[self.registry_name] = self
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         hidden_states = x.reshape(-1, orig_shape[-1])
         router_logits, _ = self.gate(hidden_states)
-        out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        out = torch.ops.vllm.dragon_latent_moe(
+            hidden_states, router_logits, _encode_layer_name(self.registry_name)
+        )
         return out.reshape(orig_shape)
+
+    def forward_dispatch(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        if self._small_path and hidden_states.shape[0] <= SMALL_BATCH_MAX_TOKENS:
+            w_in, w_out = self._small_path_weights()
+            re = self.experts.routed_experts
+            return dragon_moe_small(
+                hidden_states,
+                router_logits,
+                self.gate.e_score_correction_bias,
+                w_in,
+                w_out,
+                re.w13_weight,
+                re.w2_weight,
+                self.top_k,
+                self.routed_scaling_factor,
+            )
+        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
+    def _small_path_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concatenated projections for the small-batch path.
+
+        ``w_in = [fc1_latent ; shared_up]`` shares the input GEMV and
+        ``w_out = [fc2_latent | shared_down]`` folds the shared+routed add into
+        one K-concatenated GEMV. Built once from the live parameters; call
+        invalidate_weight_caches() after an in-place weight reload.
+        """
+        if self._small_w is None:
+            w_in = torch.cat(
+                [self.fc1_latent_proj.weight, self.shared_experts.up_proj.weight], 0
+            ).contiguous()
+            w_out = torch.cat(
+                [self.fc2_latent_proj.weight, self.shared_experts.down_proj.weight], 1
+            ).contiguous()
+            self._small_w = (w_in, w_out)
+        return self._small_w
+
+    def invalidate_weight_caches(self) -> None:
+        self._small_w = None
 
 
 @triton.jit
