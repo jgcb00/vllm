@@ -322,7 +322,14 @@ def _geodesic_norm_kernel(
     stride_x,
     stride_g,
     stride_o,
+    nw_ptr,      # next norm gain (D,) — only read when HAS_NORM
+    xn_ptr,      # normalized output (rows, D) — only written when HAS_NORM
+    stride_xn,
+    eps,
+    lns,
     BLOCK: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+    ZERO_CENTERED: tl.constexpr,
 ):
     """Fused geodesic residual update, one program per token row.
 
@@ -330,6 +337,11 @@ def _geodesic_norm_kernel(
     the ~15 small elementwise/reduction kernels of the eager reference, which
     otherwise dominate decode launch overhead at two calls per layer. Uses
     ``||g - c*x||² = ||g||² - 2c(x·g) + c²||x||²`` to avoid a second pass.
+
+    With HAS_NORM the program also emits the *next* block's normalized input
+    ``lns * RMSNorm(out) * gain`` from the bf16-rounded ``out`` — the same
+    rounding steps as DragonRMSNorm on the stored hidden state — so the
+    following norm launch disappears.
     """
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -353,11 +365,21 @@ def _geodesic_norm_kernel(
     theta = tl.minimum((theta * scale + bias) * inv_depth, clamp_val)
 
     out = x * tl.cos(theta) + (g - coeff * x) * (safe_R * tl.sin(theta) / safe_tangent)
-    tl.store(
-        out_ptr + row * stride_o + offs,
-        out.to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    out_b = out.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + row * stride_o + offs, out_b, mask=mask)
+
+    if HAS_NORM:
+        r = out_b.to(tl.float32)
+        r = tl.where(mask, r, 0.0)
+        inv = 1.0 / tl.sqrt(tl.sum(r * r, axis=0) / D + eps)
+        y = (r * inv).to(xn_ptr.dtype.element_ty).to(tl.float32)
+        w = tl.load(nw_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        if ZERO_CENTERED:
+            w = (1.0 + w).to(xn_ptr.dtype.element_ty).to(tl.float32)
+        y = (y * w).to(xn_ptr.dtype.element_ty).to(tl.float32)
+        if lns != 1.0:
+            y = y * lns
+        tl.store(xn_ptr + row * stride_xn + offs, y.to(xn_ptr.dtype.element_ty), mask=mask)
 
 
 class DragonGeodesicNorm(nn.Module):
@@ -378,11 +400,30 @@ class DragonGeodesicNorm(nn.Module):
         self.register_buffer("prosres_scalar", torch.tensor(1.0))
         self.clamp = torch.pi / 4.0
 
-    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        next_norm: nn.Module | None = None,
+        lns: float = 1.0,
+    ):
+        """Geodesic update; with ``next_norm`` (a DragonNorm) also returns
+        ``lns * next_norm(out)`` computed in the same kernel."""
+        fuse = next_norm is not None and isinstance(next_norm, DragonNorm)
         if not (x.is_cuda and x.stride(-1) == 1 and g.stride(-1) == 1):
-            return self.forward_native(x, g)
+            out = self.forward_native(x, g)
+            if next_norm is None:
+                return out
+            xn = next_norm(out)
+            return out, (lns * xn if lns != 1.0 else xn)
         out = torch.empty_like(x)
         D = x.shape[-1]
+        if fuse:
+            rms = next_norm.norm
+            xn = torch.empty_like(x)
+            nw, eps, zc = rms.weight, rms.eps, rms.zero_centered
+        else:
+            xn, nw, eps, zc = out, self.scale, 0.0, False
         _geodesic_norm_kernel[(x.numel() // D,)](
             x,
             g,
@@ -395,10 +436,22 @@ class DragonGeodesicNorm(nn.Module):
             x.stride(-2) if x.dim() > 1 else 0,
             g.stride(-2) if g.dim() > 1 else 0,
             out.stride(-2) if out.dim() > 1 else 0,
+            nw,
+            xn,
+            xn.stride(-2) if xn.dim() > 1 else 0,
+            eps,
+            lns,
             BLOCK=triton.next_power_of_2(D),
+            HAS_NORM=fuse,
+            ZERO_CENTERED=zc,
             num_warps=2,  # measured fastest at batch 1 (1.56 us) and batch 256
         )
-        return out
+        if next_norm is None:
+            return out
+        if fuse:
+            return out, xn
+        xn2 = next_norm(out)
+        return out, (lns * xn2 if lns != 1.0 else xn2)
 
     def forward_native(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """Eager reference. Kept as the non-CUDA path and the parity baseline."""
@@ -570,14 +623,26 @@ class DragonMonoBlock(nn.Module):
         *,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """Flat-token forward: ``(N, D)`` in, ``(N, D)`` out."""
+        x_normed: torch.Tensor | None = None,
+        next_norm: nn.Module | None = None,
+        next_lns: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Flat-token forward: ``(N, D)`` in, ``(N, D)`` out.
+
+        ``x_normed`` is this block's already-normalized input when the
+        previous block's geodesic update produced it; ``next_norm`` asks the
+        MLP-side geodesic update to also emit the next consumer's normalized
+        input (returned as the second element, else None).
+        """
         n = hidden_states.shape[0]
 
         residual = hidden_states
-        x = self.input_norm(hidden_states)
-        if self.lns != 1.0:
-            x = self.lns * x
+        if x_normed is None:
+            x = self.input_norm(hidden_states)
+            if self.lns != 1.0:
+                x = self.lns * x
+        else:
+            x = x_normed
         y_mix = self._mix(x, positions)  # (N, H_local * D)
         if self.use_gate:
             g_all, _ = self.gate_proj(x)
@@ -593,18 +658,22 @@ class DragonMonoBlock(nn.Module):
             y_mix, _ = self.mixer_proj(y_mix)
 
         if self.is_geodesic:
-            hidden_states = self.geodesic_mixer(residual, y_mix)
+            hidden_states, x = self.geodesic_mixer(
+                residual, y_mix, next_norm=self.postmixer_norm, lns=self.lns
+            )
         else:
             hidden_states = self.b * residual + self.a * y_mix
+            x = self.postmixer_norm(hidden_states)
+            if self.lns != 1.0:
+                x = self.lns * x
 
         residual = hidden_states
-        x = self.postmixer_norm(hidden_states)
-        if self.lns != 1.0:
-            x = self.lns * x
         y_mlp = self.mlp(x)
         if self.is_geodesic:
-            return self.geodesic_mlp(residual, y_mlp)
-        return self.b * residual + self.a * y_mlp
+            if next_norm is None:
+                return self.geodesic_mlp(residual, y_mlp), None
+            return self.geodesic_mlp(residual, y_mlp, next_norm=next_norm, lns=next_lns)
+        return self.b * residual + self.a * y_mlp, None
 
 
 @support_torch_compile(
@@ -683,11 +752,30 @@ class DragonModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(positions=positions, hidden_states=hidden_states)
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        x_normed = None
+        for i, layer in enumerate(layers):
+            if i + 1 < len(layers):
+                nxt = layers[i + 1]
+                next_norm, next_lns = nxt.input_norm, nxt.lns
+            elif get_pp_group().is_last_rank:
+                next_norm, next_lns = self.final_norm, 1.0
+            else:
+                next_norm, next_lns = None, 1.0
+            if not isinstance(next_norm, DragonNorm):
+                next_norm = None  # Identity / PPMissingLayer: nothing to fuse
+            hidden_states, x_normed = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                x_normed=x_normed,
+                next_norm=next_norm,
+                next_lns=next_lns,
+            )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
+        if x_normed is not None and isinstance(self.final_norm, DragonNorm):
+            return x_normed  # final norm fused into the last geodesic update
         return self.final_norm(hidden_states)
 
 
