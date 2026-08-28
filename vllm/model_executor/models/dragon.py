@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.mamba.dragon.decode_gemv import dragon_linear
 from vllm.model_executor.layers.mamba.dragon.latent_moe_decode import (
     SMALL_BATCH_MAX_TOKENS,
     dragon_moe_small,
+    moe_cat_shared,
 )
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.model_executor.layers.fused_moe import (
@@ -216,8 +218,19 @@ class DragonLatentMoE(nn.Module):
             prefix=f"{prefix}.fc2_latent_proj",
         )
 
-        self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
+        # Single rank, unquantized: the latent projections and the shared
+        # expert are handled here around a bare routed-experts FusedMoE — one
+        # GEMM on [fc1_latent ; shared_up], routed experts on the latent slice,
+        # one K-concatenated GEMM on [fc2_latent | shared_down] that also
+        # absorbs the shared+routed add; the routed scale folds into the
+        # router weights. Otherwise the runner owns transforms and shared.
+        self._fused_proj = (
+            self.shared_experts is not None
+            and quant_config is None
+            and get_tensor_model_parallel_world_size() == 1
+            and not parallel_config.enable_eplb
+        )
+        moe_kwargs = dict(
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.latent_size,
@@ -227,16 +240,25 @@ class DragonLatentMoE(nn.Module):
             scoring_func="sigmoid",
             e_score_correction_bias=self.gate.e_score_correction_bias,
             activation=activation_without_mul("relu2"),
-            routed_input_transform=self.fc1_latent_proj,
-            routed_output_transform=self.fc2_latent_proj,
             routed_scaling_factor=config.moe_routed_scaling_factor,
-            apply_routed_scale_to_output=True,
             router_logits_dtype=self.gate.out_dtype,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=parallel_config.eplb_config.num_redundant_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        if self._fused_proj:
+            self.experts = FusedMoE(
+                shared_experts=None, apply_routed_scale_to_output=False, **moe_kwargs
+            )
+        else:
+            self.experts = FusedMoE(
+                shared_experts=self.shared_experts,
+                routed_input_transform=self.fc1_latent_proj,
+                routed_output_transform=self.fc2_latent_proj,
+                apply_routed_scale_to_output=True,
+                **moe_kwargs,
+            )
 
         # Small-batch (decode) path: two gather-GEMV kernels instead of the
         # generic permute/grouped-gemm pipeline. Single GPU, unquantized only;
@@ -244,11 +266,7 @@ class DragonLatentMoE(nn.Module):
         self.routed_scaling_factor = float(config.moe_routed_scaling_factor)
         self._small_w: tuple[torch.Tensor, torch.Tensor] | None = None
         self._small_path = (
-            self.shared_experts is not None
-            and quant_config is None
-            and get_tensor_model_parallel_world_size() == 1
-            and not parallel_config.enable_eplb
-            and os.environ.get("DRAGON_MOE_SMALL", "1") != "0"
+            self._fused_proj and os.environ.get("DRAGON_MOE_SMALL", "1") != "0"
         )
 
         # Registered like the mixers so the MoE call is one opaque custom op
@@ -285,6 +303,13 @@ class DragonLatentMoE(nn.Module):
                 self.top_k,
                 self.routed_scaling_factor,
             )
+        if self._fused_proj:
+            w_in, w_out = self._small_path_weights()
+            x_in = F.linear(hidden_states, w_in)
+            latent = x_in[:, : self.latent_size].contiguous()
+            routed = self.experts(hidden_states=latent, router_logits=router_logits)
+            cat = moe_cat_shared(routed, x_in[:, self.latent_size :])
+            return F.linear(cat, w_out)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
     def _small_path_weights(self) -> tuple[torch.Tensor, torch.Tensor]:

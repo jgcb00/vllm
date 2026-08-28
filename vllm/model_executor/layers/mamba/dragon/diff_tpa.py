@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -346,10 +347,11 @@ class DragonDiffTPAAttention(PluggableLayer):
     ) -> None:
         n = hidden_states.shape[0]
 
-        if n == 1 and os.environ.get("DRAGON_TPA_CONCAT", "1") != "0":
-            # Single-token decode: the six input projections share one
+        if self._proj_concat_ok and os.environ.get("DRAGON_TPA_CONCAT", "1") != "0":
+            # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
-            allp = decode_gemv(hidden_states, self._decode_proj_weight())
+            w_all = self._decode_proj_weight()
+            allp = decode_gemv(hidden_states, w_all) if n == 1 else F.linear(hidden_states, w_all)
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
             q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
             shift_alphas = tuple(parts[6:]) if self.token_shift else None
@@ -407,6 +409,13 @@ class DragonDiffTPAAttention(PluggableLayer):
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
+
+    @property
+    def _proj_concat_ok(self) -> bool:
+        return get_tensor_model_parallel_world_size() == 1 and all(
+            m.bias is None for m in (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
+                                     self.W_B_v, self.lambda_proj)
+        )
 
     def _decode_proj_weight(self) -> torch.Tensor:
         """Concatenated [c_q; W_A_k; W_A_v; W_B_k; W_B_v; lambda_proj] weights

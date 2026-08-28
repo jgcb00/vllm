@@ -146,6 +146,40 @@ def _latent_moe_epilogue_kernel(
         tl.store(cat_ptr + m * (D2 + S) + offs, (v * v).to(tl.bfloat16))
 
 
+@triton.jit
+def _moe_cat_kernel(
+    routed_ptr,  # [M, D2] bf16 (already routed-scaled)
+    s_ptr,       # [M, S] bf16 shared pre-activation (row stride S_LD)
+    cat_ptr,     # [M, D2 + S] bf16 out: [routed | relu2(s)]
+    S_LD, R_LD,
+    D2: tl.constexpr,
+    S: tl.constexpr,
+    BS: tl.constexpr,
+):
+    m = tl.program_id(0)
+    nb = tl.program_id(1)
+    offs = nb * BS + tl.arange(0, BS)
+    if nb * BS < D2:
+        r = tl.load(routed_ptr + m * R_LD + offs)
+        tl.store(cat_ptr + m * (D2 + S) + offs, r)
+    else:
+        so = offs - D2
+        a = tl.load(s_ptr + m * S_LD + so).to(tl.float32)
+        a = tl.maximum(a, 0.0)
+        tl.store(cat_ptr + m * (D2 + S) + offs, (a * a).to(tl.bfloat16))
+
+
+def moe_cat_shared(routed: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """[routed | relu2(s)] in one launch (generic-M path of the latent MoE)."""
+    M, D2 = routed.shape
+    S = s.shape[1]
+    cat = torch.empty(M, D2 + S, dtype=routed.dtype, device=routed.device)
+    _moe_cat_kernel[(M, (D2 + S) // 128)](
+        routed, s, cat, s.stride(0), routed.stride(0), D2=D2, S=S, BS=128, num_warps=1
+    )
+    return cat
+
+
 def dragon_moe_small(
     hidden: torch.Tensor,         # [M, hidden] bf16
     router_logits: torch.Tensor,  # [M, E] fp32

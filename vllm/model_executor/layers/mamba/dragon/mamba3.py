@@ -284,6 +284,11 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             prefix=f"{prefix}.in_proj_dyn",
         )
 
+        self._in_proj_cat_w: torch.Tensor | None = None
+        self._in_proj_cat_ok = (
+            tp == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None
+        )
+
         head_shard = {"weight_loader": sharded_weight_loader(0)}
         self.B_bias = nn.Parameter(
             torch.ones(
@@ -459,9 +464,20 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         return x, z, _A, DT, trap, bn_cn
 
     def _decode_in_proj(self, u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """in_proj / in_proj_dyn for decode rows; streaming GEMVs at batch 1."""
-        if u.shape[0] == 1 and self.in_proj.bias is None and self.in_proj_dyn.bias is None:
-            return decode_gemv(u, self.in_proj.weight), decode_gemv(u, self.in_proj_dyn.weight)
+        """in_proj / in_proj_dyn for decode rows.
+
+        Single rank, no bias: one GEMM over the concatenated weights (cached;
+        the preamble kernel takes the resulting row stride), streaming GEMV at
+        batch 1. Otherwise the two parallel linears.
+        """
+        if self._in_proj_cat_ok:
+            w = self._in_proj_cat_w
+            if w is None:
+                w = torch.cat([self.in_proj.weight, self.in_proj_dyn.weight], 0).contiguous()
+                self._in_proj_cat_w = w
+            out = decode_gemv(u, w) if u.shape[0] == 1 else F.linear(u, w)
+            n1 = self.in_proj.weight.shape[0]
+            return out[:, :n1], out[:, n1:]
         zxdt, _ = self.in_proj(u)
         bc, _ = self.in_proj_dyn(u)
         return zxdt, bc
@@ -732,6 +748,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         """
         self._prefill_const_w = None
         self._decode_const_w = None
+        self._in_proj_cat_w = None
 
     def _decode_const_weights(self):
         """Rearranged constant weights for the decode-step kernels.
@@ -744,8 +761,8 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         cw = self._decode_const_w
         if cw is None:
             cw = (
-                rearrange(self.C_bias, "h r n -> r h n"),
-                rearrange(self.B_bias, "h r n -> r h n"),
+                rearrange(self.C_bias, "h r n -> r h n").contiguous(),
+                rearrange(self.B_bias, "h r n -> r h n").contiguous(),
                 rearrange(self.in_proj_mimo_x, "h r p -> r h p").contiguous(),
                 rearrange(self.in_proj_mimo_z, "h r p -> r h p").contiguous(),
                 rearrange(self.out_proj_mimo, "h r p -> r h p").contiguous(),
