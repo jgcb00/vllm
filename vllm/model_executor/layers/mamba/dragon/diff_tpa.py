@@ -30,6 +30,10 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.dragon.diff_tpa_decode import (
+    tpa_decode_qkv,
+    tpa_diff_combine,
+)
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.linear import (
@@ -364,6 +368,31 @@ class DragonDiffTPAAttention(PluggableLayer):
             lam_all, _ = self.lambda_proj(hidden_states)
             shift_alphas = None
 
+        md = None
+        if shift_alphas is not None and self._fused_decode_ok:
+            attn_metadata = get_forward_context().attn_metadata
+            if attn_metadata is not None:
+                md = attn_metadata[self.shift_state.prefix]
+                if md.num_prefills != 0 or md.spec is not None:
+                    md = None
+        if md is not None:
+            # Pure decode batch: one kernel per (token, kv head) for the K/V
+            # reconstruction, token shift, q/k norms and softmax scaling.
+            k_pool, v_pool = self.shift_state.kv_cache
+            q_flat, k_flat, v_flat = tpa_decode_qkv(
+                q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                shift_alphas[0], shift_alphas[1], positions,
+                md.state_indices_tensor, k_pool, v_pool,
+                self.q_norm.norm.weight, self.k_norm.norm.weight,
+                self.q_norm.norm.eps, self.softmax_scaler,
+                float(getattr(self.config, "sliding_window_size", 0) or 0),
+                self.num_kv_heads_local, self.snr + 1, self.rank, self.head_dim,
+            )
+            attn_out = self.attn(q_flat, k_flat, v_flat)
+            tpa_diff_combine(attn_out, lam_all, out, self.num_noise_heads_local,
+                             self.snr, self.head_dim)
+            return
+
         q = q_all.view(n, self.num_attention_heads_local, self.head_dim)
         A_k = A_k_all.view(n, self.num_kv_heads_local, self.rank)
         A_v = A_v_all.view(n, self.num_kv_heads_local, self.rank)
@@ -409,6 +438,18 @@ class DragonDiffTPAAttention(PluggableLayer):
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
+
+    @property
+    def _fused_decode_ok(self) -> bool:
+        return (
+            self.token_shift
+            and self.qk_norm
+            and self.rotary_emb is None
+            and self.scalable_softmax
+            and self.q_norm.norm.zero_centered
+            and self.k_norm.norm.zero_centered
+            and self.head_dim & (self.head_dim - 1) == 0
+        )
 
     @property
     def _proj_concat_ok(self) -> bool:
