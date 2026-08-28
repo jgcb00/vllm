@@ -29,6 +29,9 @@ from vllm.utils.torch_utils import (
 )
 
 SMALL_BATCH_MAX_TOKENS = 16
+# Above this many tokens the concatenated-projection path costs more in
+# activation traffic than it saves in launches (measured on 24k prefills).
+FUSED_PROJ_MAX_TOKENS = 512
 
 
 @triton.jit

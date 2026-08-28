@@ -42,6 +42,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.mamba.dragon.decode_gemv import dragon_linear
 from vllm.model_executor.layers.mamba.dragon.latent_moe_decode import (
+    FUSED_PROJ_MAX_TOKENS,
     SMALL_BATCH_MAX_TOKENS,
     dragon_moe_small,
     moe_cat_shared,
@@ -303,13 +304,20 @@ class DragonLatentMoE(nn.Module):
                 self.top_k,
                 self.routed_scaling_factor,
             )
-        if self._fused_proj:
+        if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
             x_in = F.linear(hidden_states, w_in)
             latent = x_in[:, : self.latent_size].contiguous()
             routed = self.experts(hidden_states=latent, router_logits=router_logits)
             cat = moe_cat_shared(routed, x_in[:, self.latent_size :])
             return F.linear(cat, w_out)
+        if self._fused_proj:
+            # Large prefill batches: the concatenation traffic outweighs the
+            # saved launches, so run the projections separately.
+            latent, _ = self.fc1_latent_proj(hidden_states)
+            routed = self.experts(hidden_states=latent, router_logits=router_logits)
+            out, _ = self.fc2_latent_proj(routed)
+            return out + self.shared_experts(hidden_states)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
     def _small_path_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
