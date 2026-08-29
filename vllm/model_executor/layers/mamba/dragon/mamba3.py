@@ -28,6 +28,11 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.dragon.mamba3_step_cuda import (
+    cuda_step_enabled,
+    cuda_step_supported,
+    mamba3_step_cuda,
+)
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -942,29 +947,45 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         )
         y = out.view(out.shape[0], H, D) if y_is_out else torch.empty_like(x)
 
-        _mamba3_step_fn(
-            ssm_pool,
-            k_pool,
-            v_pool,
-            _A,
-            B.to(torch.bfloat16),
-            C.to(torch.bfloat16),
-            self.D,
-            x,
-            DT,
-            trap,
-            xpj,
-            outpj,
-            None,  # in-place pool update
-            y,
-            z=z,
-            zproj=zpj,
-            state_batch_indices=slots32,
-            update_kv_state=kernel_writes_kv,
-            tile_D=_STEP_TILE_D,
-            num_warps=_STEP_NUM_WARPS,
-            **rotary_kwargs,
+        use_cuda_step = (
+            fuse_rotary
+            and cuda_step_enabled()
+            and B.dtype == torch.bfloat16
+            and cuda_step_supported(
+                ssm_pool, k_pool, v_pool, angle_pool, B[:, :, 0], C[:, :, 0], angle[:, 0],
+                H, D, S, R, self.num_rope_angles,
+            )
         )
+        if use_cuda_step:
+            # Persistent CUDA step (tensor-core update + C dot, cp.async state pipeline).
+            mamba3_step_cuda(
+                ssm_pool, k_pool, v_pool, angle_pool, _A, B[:, :, 0], C[:, :, 0], self.D, x, DT, trap,
+                xpj, zpj, outpj, z, bias_q, bias_k, angle[:, 0], slots32, y,
+            )
+        else:
+            _mamba3_step_fn(
+                ssm_pool,
+                k_pool,
+                v_pool,
+                _A,
+                B.to(torch.bfloat16),
+                C.to(torch.bfloat16),
+                self.D,
+                x,
+                DT,
+                trap,
+                xpj,
+                outpj,
+                None,  # in-place pool update
+                y,
+                z=z,
+                zproj=zpj,
+                state_batch_indices=slots32,
+                update_kv_state=kernel_writes_kv,
+                tile_D=_STEP_TILE_D,
+                num_warps=_STEP_NUM_WARPS,
+                **rotary_kwargs,
+            )
         if not kernel_writes_kv:
             k_pool[slots] = B
             v_pool[slots] = x
