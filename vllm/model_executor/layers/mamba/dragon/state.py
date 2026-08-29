@@ -73,17 +73,27 @@ def mamba3_state_shape(
 def token_shift_state_dtype(
     model_dtype: ModelDType | torch.dtype,
     mamba_cache_dtype: MambaDType,
-) -> tuple[torch.dtype, torch.dtype]:
-    """Dtypes of the Differential-TPA ``(k_last, v_last)`` buffer."""
+    rank: int = 0,
+) -> tuple[torch.dtype, ...]:
+    """Dtypes of the Differential-TPA ``(k_last, v_last[, A_k_last, A_v_last])`` buffer."""
     state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
-    return (state_dtype, state_dtype)
+    return (state_dtype,) * (4 if rank else 2)
 
 
 def token_shift_state_shape(
     tp_world_size: int,
     num_kv_heads: int,
     head_dim: int,
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Shapes of the Differential-TPA ``(k_last, v_last)`` buffer."""
+    rank: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    """Shapes of the Differential-TPA ``(k_last, v_last)`` buffer.
+
+    With ``rank`` > 0 (TPA-factorized KV cache) the previous token's rank
+    coefficients ``(A_k_last, A_v_last)`` are kept as well: the factor row of
+    token ``t`` carries ``alpha_t * A[t-1]`` for the token-shift term.
+    """
     kv = divide(num_kv_heads, tp_world_size)
-    return (kv, head_dim), (kv, head_dim)
+    shapes: tuple[tuple[int, int], ...] = ((kv, head_dim), (kv, head_dim))
+    if rank:
+        shapes += ((kv, rank), (kv, rank))
+    return shapes

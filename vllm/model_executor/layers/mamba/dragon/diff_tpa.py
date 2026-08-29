@@ -34,6 +34,22 @@ from vllm.model_executor.layers.mamba.dragon.diff_tpa_decode import (
     tpa_decode_qkv,
     tpa_diff_combine,
 )
+from vllm.model_executor.layers.mamba.dragon.tpa_factor import (
+    HKV as FACTOR_HKV,
+    HQ as FACTOR_HQ,
+    DragonTPAFactorCache,
+    factor_cache_enabled,
+    factor_decode_attention,
+    factor_decode_write,
+    factor_rows,
+    num_splits_for_batch,
+    reconstruct_dense,
+    write_rows,
+)
+from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+    get_flash_attn_version,
+)
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.linear import (
@@ -144,10 +160,12 @@ class DragonTokenShiftState(nn.Module, MambaBase):
         head_dim: int,
         vllm_config: VllmConfig,
         prefix: str,
+        rank: int = 0,
     ):
         super().__init__()
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.rank = rank  # > 0: also keep the previous token's A_k / A_v (factor cache)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -165,6 +183,7 @@ class DragonTokenShiftState(nn.Module, MambaBase):
         return token_shift_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
+            self.rank,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
@@ -172,6 +191,7 @@ class DragonTokenShiftState(nn.Module, MambaBase):
             tp_world_size=self.tp_size,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
+            rank=self.rank,
         )
 
 
@@ -273,6 +293,21 @@ class DragonDiffTPAAttention(PluggableLayer):
         self.W_B_v = replicated(self.rank * self.head_dim, "W_B_v")
         self.lambda_proj = column(self.num_noise_heads, "lambda_proj")
 
+        # TPA-factorized paged KV cache (2.5x smaller than dense K/V): needs
+        # the exact Dragon V-layer recipe the decode kernel implements.
+        self.factor_mode = (
+            factor_cache_enabled()
+            and tp == 1
+            and self.token_shift
+            and self.qk_norm
+            and bool(getattr(config, "scalable_softmax", False))
+            and float(getattr(config, "rope_theta", 0.0) or 0.0) == 0.0
+            and self.num_attention_heads == FACTOR_HQ
+            and self.num_kv_heads == FACTOR_HKV
+            and self.rank == 4
+            and self.head_dim == 128
+        )
+
         if self.token_shift:
             self.shift_proj_k = column(self.num_kv_heads, "shift_proj_k")
             self.shift_proj_v = column(self.num_kv_heads, "shift_proj_v")
@@ -281,6 +316,7 @@ class DragonDiffTPAAttention(PluggableLayer):
                 head_dim=self.head_dim,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.shift_state",
+                rank=self.rank if self.factor_mode else 0,
             )
         else:
             self.shift_state = None
@@ -311,15 +347,23 @@ class DragonDiffTPAAttention(PluggableLayer):
             if getattr(config, "use_completed_p", False)
             else self.head_dim**-0.5
         )
-        self.attn = Attention(
-            num_heads=self.num_attention_heads_local,
-            head_size=self.head_dim,
-            scale=scale,
-            num_kv_heads=self.num_kv_heads_local,
-            cache_config=vllm_config.cache_config,
-            logits_soft_cap=self.softcap if self.softcap > 0.0 else None,
-            prefix=f"{prefix}.attn",
-        )
+        self.scale = scale
+        if self.factor_mode:
+            self.attn = None
+            self.factor_cache = DragonTPAFactorCache(
+                vllm_config=vllm_config, prefix=f"{prefix}.factor"
+            )
+        else:
+            self.factor_cache = None
+            self.attn = Attention(
+                num_heads=self.num_attention_heads_local,
+                head_size=self.head_dim,
+                scale=scale,
+                num_kv_heads=self.num_kv_heads_local,
+                cache_config=vllm_config.cache_config,
+                logits_soft_cap=self.softcap if self.softcap > 0.0 else None,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(
         self,
@@ -367,6 +411,13 @@ class DragonDiffTPAAttention(PluggableLayer):
             B_v_all, _ = self.W_B_v(hidden_states)
             lam_all, _ = self.lambda_proj(hidden_states)
             shift_alphas = None
+
+        if self.factor_mode:
+            self._forward_factor(
+                positions, hidden_states, out, q_all, A_k_all, A_v_all,
+                B_k_all, B_v_all, lam_all, shift_alphas,
+            )
+            return
 
         md = None
         if shift_alphas is not None and self._fused_decode_ok:
@@ -438,6 +489,202 @@ class DragonDiffTPAAttention(PluggableLayer):
         lam = lam_all.view(n, self.num_noise_heads_local, 1, 1)
         diff = sig - torch.sigmoid(lam) * noi
         out.copy_(diff.reshape(n, self.num_signal_heads_local * self.head_dim))
+
+    # ------------------------------------------------------------------
+    # TPA-factorized KV cache path
+    # ------------------------------------------------------------------
+
+    def _q_for_attention(self, q_all: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Eager q pre-processing: zero-centered RMSNorm + scalable softmax scale."""
+        n = q_all.shape[0]
+        q = self.q_norm(q_all.view(n, self.num_attention_heads_local, self.head_dim))
+        pos = (positions.float() + 1.0).clamp_min(1.0)
+        wsize = float(getattr(self.config, "sliding_window_size", 0) or 0)
+        log_pos = pos.clamp_max(wsize).log() if wsize > 0 else pos.log()
+        scale = self.softmax_scaler.to(q.dtype) * log_pos.to(q.dtype).unsqueeze(-1)
+        return q * scale.unsqueeze(-1)
+
+    def _forward_factor(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        out: torch.Tensor,
+        q_all: torch.Tensor,
+        A_k_all: torch.Tensor,
+        A_v_all: torch.Tensor,
+        B_k_all: torch.Tensor,
+        B_v_all: torch.Tensor,
+        lam_all: torch.Tensor,
+        shift_alphas: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        n = hidden_states.shape[0]
+        if shift_alphas is None:
+            alpha_k_all, _ = self.shift_proj_k(hidden_states)
+            alpha_v_all, _ = self.shift_proj_v(hidden_states)
+        else:
+            alpha_k_all, alpha_v_all = shift_alphas
+        fc = get_forward_context()
+        attn_out = torch.empty(
+            n, self.num_attention_heads_local * self.head_dim,
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        if fc.attn_metadata is None:
+            # Profiling / dry run: no paged cache yet; dense causal attention
+            # over the batch as one document (same activation footprint).
+            self._factor_dry_run(positions, q_all, A_k_all, A_v_all, B_k_all,
+                                 B_v_all, alpha_k_all, alpha_v_all, attn_out)
+        else:
+            md = fc.attn_metadata[self.factor_cache.prefix]
+            ms: DragonDiffTPAMetadata = fc.attn_metadata[self.shift_state.prefix]
+            kv = self.factor_cache.kv_cache
+            kplane, vplane = kv[0], kv[1]
+            if os.environ.get("DRAGON_TPA_DEBUG") and not getattr(self, "_dbg_once", False):
+                self._dbg_once = True
+                print(f"[tpa-factor] kv shape {tuple(kv.shape)} strides {kv.stride()} contiguous={kv.is_contiguous()}", flush=True)
+            slot_mapping = fc.slot_mapping[self.factor_cache.prefix]
+            nd, ndt = md.num_decodes, md.num_decode_tokens
+            np_, npt = md.num_prefills, md.num_prefill_tokens
+            if ms.spec is not None:
+                raise NotImplementedError(
+                    "speculative decoding with DRAGON_TPA_FACTOR=1")
+            if nd > 0 and os.environ.get("DRAGON_TPA_FACTOR_DECODE_DENSE") == "1":
+                # Debug: route decode rows through the write + reconstruct + FA path.
+                reqs = (nd, list(range(nd + 1)), md.seq_lens[:nd].tolist(), [True] * nd,
+                        ms.state_indices_tensor[:nd].tolist(), 0)
+                attn_out[:nd] = self._factor_prefill(
+                    md, ms, positions[:nd], q_all[:nd], A_k_all[:nd], A_v_all[:nd],
+                    B_k_all[:nd], B_v_all[:nd], alpha_k_all[:nd], alpha_v_all[:nd],
+                    slot_mapping[:nd], kplane, vplane, reqs=reqs,
+                )
+            elif nd > 0:
+                assert ndt == nd, "factor decode path expects one token per decode request"
+                k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+                q_d = factor_decode_write(
+                    q_all[:nd], A_k_all[:nd], A_v_all[:nd], B_k_all[:nd], B_v_all[:nd],
+                    alpha_k_all[:nd], alpha_v_all[:nd], positions[:nd],
+                    ms.state_indices_tensor[:nd], slot_mapping[:nd],
+                    k_pool, v_pool, ak_pool, av_pool,
+                    self.q_norm.norm.weight, self.k_norm.norm.weight,
+                    self.q_norm.norm.eps, self.softmax_scaler,
+                    float(getattr(self.config, "sliding_window_size", 0) or 0),
+                    kplane, vplane,
+                    self.snr + 1,
+                )
+                nsplit = num_splits_for_batch(nd)
+                factor_decode_attention(
+                    q_d, kplane, vplane, md.block_table[:nd], md.seq_lens[:nd],
+                    md.split_size(nsplit), nsplit, self.scale, self.softcap,
+                    self.factor_cache.block_size, out=attn_out[:nd],
+                )
+            if np_ > 0:
+                rows = slice(ndt, ndt + npt)
+                attn_out[rows] = self._factor_prefill(
+                    md, ms, positions[rows], q_all[rows], A_k_all[rows], A_v_all[rows],
+                    B_k_all[rows], B_v_all[rows], alpha_k_all[rows], alpha_v_all[rows],
+                    slot_mapping[rows], kplane, vplane,
+                )
+            if ndt + npt < n:
+                attn_out[ndt + npt :] = 0  # cudagraph padding rows
+        tpa_diff_combine(attn_out, lam_all, out, self.num_noise_heads_local,
+                         self.snr, self.head_dim)
+
+    def _factor_prefill(
+        self, md, ms, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+        alpha_k_all, alpha_v_all, slots, kplane, vplane,
+        reqs: tuple | None = None,
+    ) -> torch.Tensor:
+        """Write the chunk's factor rows, then attend over each request's
+        full context reconstructed from the cache (dense FA varlen).
+
+        ``reqs`` = (num_reqs, query_start_loc, seq_lens, has_initial_state,
+        pool_slots, first_block_table_row) overrides the prefill metadata so
+        decode rows can be routed through this path for debugging."""
+        if reqs is None:
+            reqs = (md.num_prefills, md.query_start_loc_p_cpu, md.seq_lens_p_cpu,
+                    md.has_initial_state_p_cpu, ms.state_indices_p_cpu, md.num_decodes)
+        nreq, qsl, seq_lens_cpu, has_init, pslots, bt0 = reqs
+        npt = q_all.shape[0]
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        A_k = A_k_all.view(npt, H, R)
+        A_v = A_v_all.view(npt, H, R)
+        B_k = B_k_all.view(npt, R, D)
+        B_v = B_v_all.view(npt, R, D)
+        k = torch.bmm(A_k, B_k).div_(R)
+        v = torch.bmm(A_v, B_v).div_(R)
+        k_prev, v_prev = torch.empty_like(k), torch.empty_like(v)
+        ak_prev, av_prev = torch.empty_like(A_k), torch.empty_like(A_v)
+        k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+        for r in range(nreq):
+            s, e = qsl[r], qsl[r + 1]
+            if e == s:
+                continue
+            slot = int(pslots[r])
+            if has_init[r]:
+                k_prev[s] = k_pool[slot].to(k.dtype)
+                v_prev[s] = v_pool[slot].to(v.dtype)
+                ak_prev[s] = ak_pool[slot].to(A_k.dtype)
+                av_prev[s] = av_pool[slot].to(A_v.dtype)
+            else:
+                k_prev[s] = 0
+                v_prev[s] = 0
+                ak_prev[s] = 0
+                av_prev[s] = 0
+            if e - s > 1:
+                k_prev[s + 1 : e] = k[s : e - 1]
+                v_prev[s + 1 : e] = v[s : e - 1]
+                ak_prev[s + 1 : e] = A_k[s : e - 1]
+                av_prev[s + 1 : e] = A_v[s : e - 1]
+            k_pool[slot] = k[e - 1].to(k_pool.dtype)
+            v_pool[slot] = v[e - 1].to(v_pool.dtype)
+            ak_pool[slot] = A_k[e - 1].to(ak_pool.dtype)
+            av_pool[slot] = A_v[e - 1].to(av_pool.dtype)
+
+        doc_start = (positions == 0).view(-1, 1)
+        a_k = torch.sigmoid(alpha_k_all.float()).masked_fill(doc_start, 0)
+        a_v = torch.sigmoid(alpha_v_all.float()).masked_fill(doc_start, 0)
+        ks = (a_k.unsqueeze(-1) * k_prev.float() + (1 - a_k.unsqueeze(-1)) * k.float()).to(k.dtype).float()
+        inv = torch.rsqrt(ks.pow(2).mean(-1) + self.k_norm.norm.eps)  # (npt, H)
+        kw = (1.0 + self.k_norm.norm.weight.float()).to(k.dtype)
+        write_rows(kplane, slots, factor_rows(A_k, ak_prev, B_k, a_k, inv, kw))
+        write_rows(vplane, slots, factor_rows(A_v, av_prev, B_v, a_v, None, None))
+
+        q = self._q_for_attention(q_all, positions)
+        ks_, vs_, cu_k = [], [], [0]
+        for r in range(nreq):
+            L = int(seq_lens_cpu[r])
+            ks_.append(reconstruct_dense(kplane, md.block_table[bt0 + r], L))
+            vs_.append(reconstruct_dense(vplane, md.block_table[bt0 + r], L))
+            cu_k.append(cu_k[-1] + L)
+        dev = q.device
+        out = flash_attn_varlen_func(
+            q=q, k=torch.cat(ks_), v=torch.cat(vs_),
+            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
+            cu_seqlens_q=torch.tensor(qsl, dtype=torch.int32, device=dev),
+            max_seqlen_k=max(seq_lens_cpu),
+            cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
+            softmax_scale=self.scale, causal=True, softcap=self.softcap,
+            fa_version=get_flash_attn_version(),
+        )
+        return out.reshape(npt, -1)
+
+    def _factor_dry_run(self, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                        alpha_k_all, alpha_v_all, attn_out) -> None:
+        n = q_all.shape[0]
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        k = torch.bmm(A_k_all.view(n, H, R), B_k_all.view(n, R, D)).div_(R)
+        v = torch.bmm(A_v_all.view(n, H, R), B_v_all.view(n, R, D)).div_(R)
+        a_k = torch.sigmoid(alpha_k_all.float()).unsqueeze(-1).to(k.dtype)
+        a_v = torch.sigmoid(alpha_v_all.float()).unsqueeze(-1).to(v.dtype)
+        k = self.k_norm((1 - a_k) * k)
+        v = (1 - a_v) * v
+        q = self._q_for_attention(q_all, positions)
+        cu = torch.tensor([0, n], dtype=torch.int32, device=q.device)
+        out = flash_attn_varlen_func(
+            q=q, k=k, v=v, max_seqlen_q=n, cu_seqlens_q=cu, max_seqlen_k=n, cu_seqlens_k=cu,
+            softmax_scale=self.scale, causal=True, softcap=self.softcap,
+            fa_version=get_flash_attn_version(),
+        )
+        attn_out.copy_(out.reshape(n, -1))
 
     @property
     def _fused_decode_ok(self) -> bool:
