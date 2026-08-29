@@ -27,7 +27,6 @@ bank-conflict free with no padding.
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -114,14 +113,17 @@ class DragonTPAFactorMetadata:
     positions_p_cpu: list[int] | None = None  # first position of each prefill request
     tok_per_split: dict[int, torch.Tensor] | None = None  # per nsplit, device int32 (1,)
 
-    def split_size(self, nsplit: int) -> torch.Tensor:
+    def split_size(self, nsplit: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Device (tok_per_split, num_active_splits) for a static split count."""
         if self.tok_per_split is None:
             self.tok_per_split = {}
         t = self.tok_per_split.get(nsplit)
         if t is None:
             mx = self.seq_lens.max()
-            t = ((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE
-            t = torch.clamp_min(t, MIN_SPLIT_TOKENS).to(torch.int32).reshape(1)
+            tps = ((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE
+            tps = torch.clamp_min(tps, MIN_SPLIT_TOKENS)
+            nact = (mx + tps - 1) // tps
+            t = (tps.to(torch.int32).reshape(1), nact.to(torch.int32).reshape(1))
             self.tok_per_split[nsplit] = t
         return t
 
@@ -489,29 +491,36 @@ def _load_kernel():
 
 
 @triton.jit
-def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, o_ptr,
-                           SPLIT: tl.constexpr, HQ_: tl.constexpr, HQP_: tl.constexpr, HB: tl.constexpr, D: tl.constexpr):
+def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_ptr,
+                           SPLIT: tl.constexpr, HQ_: tl.constexpr, HQP_: tl.constexpr, HB: tl.constexpr, D: tl.constexpr,
+                           CHUNK: tl.constexpr):
     """Merge the per-split (o, m, l) of one request; program = (request, block of HB heads).
 
-    The split loops are unrolled so every partial load is in flight at once
-    (the merge is latency-bound, not bandwidth-bound)."""
+    Only the first ``*nactive_ptr`` splits hold data (static grid, dynamic split
+    length); they are visited in unrolled chunks of CHUNK so the loads of a chunk
+    are in flight together (the merge is latency-bound)."""
     b = tl.program_id(0)
     offs_h = tl.program_id(1) * HB + tl.arange(0, HB)
     offs_d = tl.arange(0, D)
     hmask = offs_h < HQ_
+    nactive = tl.minimum(tl.load(nactive_ptr), SPLIT)
     m = tl.full([HB], float("-inf"), tl.float32)
-    for s in tl.static_range(SPLIT):
-        m = tl.maximum(m, tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=float("-inf")))
+    for s0 in range(0, nactive, CHUNK):
+        for j in tl.static_range(CHUNK):
+            s = s0 + j
+            m = tl.maximum(m, tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask & (s < nactive), other=float("-inf")))
     m_safe = tl.where(m == float("-inf"), 0.0, m)
     l = tl.zeros([HB], tl.float32)
     acc = tl.zeros([HB, D], tl.float32)
-    for s in tl.static_range(SPLIT):
-        ms = tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=float("-inf"))
-        w = tl.where(ms == float("-inf"), 0.0, tl.exp(ms - m_safe))
-        l += w * tl.load(part_l_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=0.0)
-        po = tl.load(part_o_ptr + ((b * SPLIT + s) * HQP_ + offs_h[:, None]) * D + offs_d[None, :],
-                     mask=hmask[:, None] & (w[:, None] > 0), other=0.0)  # empty splits leave o unwritten
-        acc += w[:, None] * po
+    for s0 in range(0, nactive, CHUNK):
+        for j in tl.static_range(CHUNK):
+            s = s0 + j
+            ms = tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask & (s < nactive), other=float("-inf"))
+            w = tl.where(ms == float("-inf"), 0.0, tl.exp(ms - m_safe))
+            l += w * tl.load(part_l_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask & (s < nactive), other=0.0)
+            po = tl.load(part_o_ptr + ((b * SPLIT + s) * HQP_ + offs_h[:, None]) * D + offs_d[None, :],
+                         mask=hmask[:, None] & (w[:, None] > 0), other=0.0)
+            acc += w[:, None] * po
     l_safe = tl.where(l == 0.0, 1.0, l)
     tl.store(o_ptr + b * HQ_ * D + offs_h[:, None] * D + offs_d[None, :], (acc / l_safe[:, None]).to(tl.bfloat16),
              mask=hmask[:, None])
@@ -531,7 +540,7 @@ def factor_decode_attention(
     vplane: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    tok_per_split: torch.Tensor,
+    split: tuple[torch.Tensor, torch.Tensor],  # (tok_per_split, num_active_splits) device int32
     nsplit: int,
     sm_scale: float,
     softcap: float,
@@ -545,10 +554,12 @@ def factor_decode_attention(
     part_l = torch.empty_like(part_m)
     bt = block_table if block_table.dtype == torch.int32 else block_table.to(torch.int32)
     sl = seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+    tok_per_split, nactive = split
     ext.launch(q.view(B, HQ, HEAD_DIM), kplane, vplane, bt, sl, tok_per_split, part_o, part_m, part_l,
                float(sm_scale), float(softcap), int(block_size))
     if out is None:
         out = torch.empty(B, HQ * HEAD_DIM, dtype=q.dtype, device=q.device)
     assert out.is_contiguous() and out.shape == (B, HQ * HEAD_DIM)
-    _factor_combine_kernel[(B, HQP // 16)](part_o, part_m, part_l, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=16, D=HEAD_DIM, num_warps=4)
+    _factor_combine_kernel[(B, HQP // 16)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=16, D=HEAD_DIM,
+                                           CHUNK=min(8, nsplit), num_warps=4)
     return out

@@ -579,6 +579,11 @@ class DragonDiffTPAAttention(PluggableLayer):
                     md.split_size(nsplit), nsplit, self.scale, self.softcap,
                     self.factor_cache.block_size, out=attn_out[:nd],
                 )
+                if os.environ.get("DRAGON_TPA_DEBUG") == "2" and bool(torch.isnan(attn_out[:nd]).any()):
+                    tps, nact = md.split_size(nsplit)
+                    bad = torch.isnan(attn_out[:nd]).view(nd, -1).any(1).nonzero().flatten().tolist()
+                    print(f"[tpa-factor NaN] layer={self.prefix} nd={nd} nsplit={nsplit} tps={int(tps)} nact={int(nact)} "
+                          f"seq_lens={md.seq_lens[:nd].tolist()} bad_rows={bad} q_nan={bool(torch.isnan(q_d).any())}", flush=True)
             if np_ > 0:
                 rows = slice(ndt, ndt + npt)
                 attn_out[rows] = self._factor_prefill(
