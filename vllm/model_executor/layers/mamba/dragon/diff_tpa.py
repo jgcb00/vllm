@@ -43,7 +43,7 @@ from vllm.model_executor.layers.mamba.dragon.tpa_factor import (
     factor_decode_write,
     factor_rows,
     num_splits_for_batch,
-    reconstruct_dense,
+    reconstruct_dense_batched,
     write_rows,
 )
 from vllm.v1.attention.backends.fa_utils import (
@@ -197,6 +197,8 @@ class DragonTokenShiftState(nn.Module, MambaBase):
 
 class DragonDiffTPAAttention(PluggableLayer):
     """Differential tensor-product attention over vLLM's paged KV."""
+
+    _factor_calls = 0  # Python executions of the factor path (debug: cudagraph coverage)
 
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -518,6 +520,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         shift_alphas: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> None:
         n = hidden_states.shape[0]
+        DragonDiffTPAAttention._factor_calls += 1
         if shift_alphas is None:
             alpha_k_all, _ = self.shift_proj_k(hidden_states)
             alpha_v_all, _ = self.shift_proj_v(hidden_states)
@@ -605,39 +608,36 @@ class DragonDiffTPAAttention(PluggableLayer):
         nreq, qsl, seq_lens_cpu, has_init, pslots, bt0 = reqs
         npt = q_all.shape[0]
         H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        dev = q_all.device
         A_k = A_k_all.view(npt, H, R)
         A_v = A_v_all.view(npt, H, R)
         B_k = B_k_all.view(npt, R, D)
         B_v = B_v_all.view(npt, R, D)
         k = torch.bmm(A_k, B_k).div_(R)
         v = torch.bmm(A_v, B_v).div_(R)
-        k_prev, v_prev = torch.empty_like(k), torch.empty_like(v)
-        ak_prev, av_prev = torch.empty_like(A_k), torch.empty_like(A_v)
+
+        # Previous-token seeds: in-batch predecessor, or the pool (or zero) at a request start.
+        qsl_t = torch.tensor(qsl, dtype=torch.int64, device=dev)
+        nonempty = qsl_t[1:] > qsl_t[:-1]
+        starts, ends = qsl_t[:-1][nonempty], qsl_t[1:][nonempty]
+        pslots_t = torch.tensor([int(x) for x in pslots], dtype=torch.int64, device=dev)[nonempty]
+        init_t = torch.tensor([bool(x) for x in has_init], dtype=torch.bool, device=dev)[nonempty]
         k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
-        for r in range(nreq):
-            s, e = qsl[r], qsl[r + 1]
-            if e == s:
-                continue
-            slot = int(pslots[r])
-            if has_init[r]:
-                k_prev[s] = k_pool[slot].to(k.dtype)
-                v_prev[s] = v_pool[slot].to(v.dtype)
-                ak_prev[s] = ak_pool[slot].to(A_k.dtype)
-                av_prev[s] = av_pool[slot].to(A_v.dtype)
-            else:
-                k_prev[s] = 0
-                v_prev[s] = 0
-                ak_prev[s] = 0
-                av_prev[s] = 0
-            if e - s > 1:
-                k_prev[s + 1 : e] = k[s : e - 1]
-                v_prev[s + 1 : e] = v[s : e - 1]
-                ak_prev[s + 1 : e] = A_k[s : e - 1]
-                av_prev[s + 1 : e] = A_v[s : e - 1]
-            k_pool[slot] = k[e - 1].to(k_pool.dtype)
-            v_pool[slot] = v[e - 1].to(v_pool.dtype)
-            ak_pool[slot] = A_k[e - 1].to(ak_pool.dtype)
-            av_pool[slot] = A_v[e - 1].to(av_pool.dtype)
+
+        def seeded(cur: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
+            prev = torch.empty_like(cur)
+            prev[1:] = cur[:-1]
+            seed = pool[pslots_t].to(cur.dtype)
+            prev[starts] = torch.where(init_t.view(-1, *([1] * (cur.dim() - 1))), seed, torch.zeros_like(seed))
+            return prev
+
+        k_prev, v_prev = seeded(k, k_pool), seeded(v, v_pool)
+        ak_prev, av_prev = seeded(A_k, ak_pool), seeded(A_v, av_pool)
+        last = ends - 1
+        k_pool[pslots_t] = k[last].to(k_pool.dtype)
+        v_pool[pslots_t] = v[last].to(v_pool.dtype)
+        ak_pool[pslots_t] = A_k[last].to(ak_pool.dtype)
+        av_pool[pslots_t] = A_v[last].to(av_pool.dtype)
 
         doc_start = (positions == 0).view(-1, 1)
         a_k = torch.sigmoid(alpha_k_all.float()).masked_fill(doc_start, 0)
@@ -649,18 +649,18 @@ class DragonDiffTPAAttention(PluggableLayer):
         write_rows(vplane, slots, factor_rows(A_v, av_prev, B_v, a_v, None, None))
 
         q = self._q_for_attention(q_all, positions)
-        ks_, vs_, cu_k = [], [], [0]
-        for r in range(nreq):
-            L = int(seq_lens_cpu[r])
-            ks_.append(reconstruct_dense(kplane, md.block_table[bt0 + r], L))
-            vs_.append(reconstruct_dense(vplane, md.block_table[bt0 + r], L))
+        lengths = [int(x) for x in seq_lens_cpu]
+        bt_rows = md.block_table[bt0 : bt0 + nreq]
+        k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
+        v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
+        cu_k = [0]
+        for L in lengths:
             cu_k.append(cu_k[-1] + L)
-        dev = q.device
         out = flash_attn_varlen_func(
-            q=q, k=torch.cat(ks_), v=torch.cat(vs_),
+            q=q, k=k_all, v=v_all,
             max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
             cu_seqlens_q=torch.tensor(qsl, dtype=torch.int32, device=dev),
-            max_seqlen_k=max(seq_lens_cpu),
+            max_seqlen_k=max(lengths),
             cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
             softmax_scale=self.scale, causal=True, softcap=self.softcap,
             fa_version=get_flash_attn_version(),

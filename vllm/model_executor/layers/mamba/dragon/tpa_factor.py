@@ -54,6 +54,7 @@ ROWP = RANK * HEAD_DIM + 2 * HKV * RANK  # 608 bf16 per plane row
 OFF_C, OFF_D = RANK * HEAD_DIM, RANK * HEAD_DIM + HKV * RANK
 TILE = 13  # tokens per kernel tile; block sizes are multiples of it
 TARGET_CTAS = 400  # ~3 CTAs per SM on GH200
+MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
 
 
 def factor_cache_enabled() -> bool:
@@ -119,7 +120,8 @@ class DragonTPAFactorMetadata:
         t = self.tok_per_split.get(nsplit)
         if t is None:
             mx = self.seq_lens.max()
-            t = (((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE).to(torch.int32).reshape(1)
+            t = ((mx + nsplit - 1) // nsplit + TILE - 1) // TILE * TILE
+            t = torch.clamp_min(t, MIN_SPLIT_TOKENS).to(torch.int32).reshape(1)
             self.tok_per_split[nsplit] = t
         return t
 
@@ -304,13 +306,29 @@ def write_rows(plane: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> 
 
 def reconstruct_dense(plane: torch.Tensor, blocks: torch.Tensor, length: int) -> torch.Tensor:
     """Dense (length, H, D) K or V of one request from its factor rows."""
+    return reconstruct_dense_batched(plane, blocks.unsqueeze(0), [length])
+
+
+def reconstruct_dense_batched(plane: torch.Tensor, block_tables: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+    """Dense (sum(lengths), H, D) K or V of several requests, concatenated.
+
+    ``block_tables[r]`` is request ``r``'s block table row; one gather over
+    the plane, one unswizzle and two einsums for the whole batch.
+    """
     bs = plane.shape[1]
-    nblk = -(-length // bs)
-    rows = plane[blocks[:nblk].long()].reshape(-1, ROWP)[:length]
-    B = swizzle_b(rows[:, :OFF_C].reshape(length, RANK, HEAD_DIM)).float()
-    C = rows[:, OFF_C:OFF_D].reshape(length, HKV, RANK).float()
-    Dc = rows[:, OFF_D:].reshape(length, HKV, RANK).float()
+    dev = plane.device
+    total = sum(lengths)
+    len_t = torch.tensor(lengths, dtype=torch.int64, device=dev)
+    starts = torch.cumsum(len_t, 0) - len_t
+    r_idx = torch.repeat_interleave(torch.arange(len(lengths), device=dev), len_t, output_size=total)
+    t_idx = torch.arange(total, device=dev) - starts[r_idx]
+    blk = block_tables[r_idx, t_idx // bs].long()
+    rows = plane[blk, t_idx % bs]  # (total, ROWP)
+    B = swizzle_b(rows[:, :OFF_C].reshape(total, RANK, HEAD_DIM)).float()
+    C = rows[:, OFF_C:OFF_D].reshape(total, HKV, RANK).float()
+    Dc = rows[:, OFF_D:].reshape(total, HKV, RANK).float()
     Bprev = torch.cat([torch.zeros_like(B[:1]), B[:-1]], dim=0)
+    Bprev = Bprev.masked_fill((t_idx == 0).view(total, 1, 1), 0.0)  # no previous token at a request start
     out = torch.einsum("lhr,lrd->lhd", C, B) + torch.einsum("lhr,lrd->lhd", Dc, Bprev)
     return out.to(plane.dtype)
 
@@ -472,30 +490,39 @@ def _load_kernel():
 
 @triton.jit
 def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, o_ptr,
-                           SPLIT: tl.constexpr, HQ_: tl.constexpr, HQP_: tl.constexpr, D: tl.constexpr):
+                           SPLIT: tl.constexpr, HQ_: tl.constexpr, HQP_: tl.constexpr, HB: tl.constexpr, D: tl.constexpr):
+    """Merge the per-split (o, m, l) of one request; program = (request, block of HB heads).
+
+    The split loops are unrolled so every partial load is in flight at once
+    (the merge is latency-bound, not bandwidth-bound)."""
     b = tl.program_id(0)
-    offs_h = tl.arange(0, HQP_)
+    offs_h = tl.program_id(1) * HB + tl.arange(0, HB)
     offs_d = tl.arange(0, D)
     hmask = offs_h < HQ_
-    m = tl.full([HQP_], float("-inf"), tl.float32)
-    for s in range(SPLIT):
+    m = tl.full([HB], float("-inf"), tl.float32)
+    for s in tl.static_range(SPLIT):
         m = tl.maximum(m, tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=float("-inf")))
     m_safe = tl.where(m == float("-inf"), 0.0, m)
-    l = tl.zeros([HQP_], tl.float32)
-    acc = tl.zeros([HQP_, D], tl.float32)
-    for s in range(SPLIT):
+    l = tl.zeros([HB], tl.float32)
+    acc = tl.zeros([HB, D], tl.float32)
+    for s in tl.static_range(SPLIT):
         ms = tl.load(part_m_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=float("-inf"))
         w = tl.where(ms == float("-inf"), 0.0, tl.exp(ms - m_safe))
         l += w * tl.load(part_l_ptr + (b * SPLIT + s) * HQP_ + offs_h, mask=hmask, other=0.0)
-        acc += w[:, None] * tl.load(part_o_ptr + ((b * SPLIT + s) * HQP_ + offs_h[:, None]) * D + offs_d[None, :],
-                                    mask=hmask[:, None], other=0.0)
+        po = tl.load(part_o_ptr + ((b * SPLIT + s) * HQP_ + offs_h[:, None]) * D + offs_d[None, :],
+                     mask=hmask[:, None] & (w[:, None] > 0), other=0.0)  # empty splits leave o unwritten
+        acc += w[:, None] * po
     l_safe = tl.where(l == 0.0, 1.0, l)
     tl.store(o_ptr + b * HQ_ * D + offs_h[:, None] * D + offs_d[None, :], (acc / l_safe[:, None]).to(tl.bfloat16),
              mask=hmask[:, None])
 
 
 def num_splits_for_batch(batch: int) -> int:
-    return max(1, min(32, -(-TARGET_CTAS // max(batch, 1))))
+    """KV splits per request: ~TARGET_CTAS CTAs in total, rounded up to a power
+    of two so the combine kernel has at most 8 specializations (all compiled
+    during cudagraph capture)."""
+    want = max(1, min(128, -(-TARGET_CTAS // max(batch, 1))))
+    return 1 << (want - 1).bit_length()
 
 
 def factor_decode_attention(
@@ -523,5 +550,5 @@ def factor_decode_attention(
     if out is None:
         out = torch.empty(B, HQ * HEAD_DIM, dtype=q.dtype, device=q.device)
     assert out.is_contiguous() and out.shape == (B, HQ * HEAD_DIM)
-    _factor_combine_kernel[(B,)](part_o, part_m, part_l, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, D=HEAD_DIM, num_warps=4)
+    _factor_combine_kernel[(B, HQP // 16)](part_o, part_m, part_l, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=16, D=HEAD_DIM, num_warps=4)
     return out

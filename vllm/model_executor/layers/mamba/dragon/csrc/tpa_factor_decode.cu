@@ -172,6 +172,11 @@ tpa_factor_decode_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat1
   const int g0 = min(row0, HQ - 1) / (HQ / HKV), g1 = min(row1, HQ - 1) / (HQ / HKV);
   const int seqlen = seqlens[b];
   const int start = sp * tok_per_split, stop = min(start + tok_per_split, seqlen);
+  if (stop <= start) {
+    // Empty split (static grid, dynamic split length): publish m = -inf / l = 0 only; the combine ignores o.
+    if (tid < HQP) { const size_t base = ((size_t)b * nsplit + sp) * HQP; part_m[base + tid] = -CUDART_INF_F; part_l[base + tid] = 0.f; }
+    return;
+  }
 
   // Q fragments (A operand, 8 k16 steps), padded heads zero
   uint32_t qa[D / 16][4];
