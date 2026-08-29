@@ -1,9 +1,3 @@
-"""Prototype (not integrated): decode attention over a TPA-factorized KV cache.
-
-Run: python tpa_factor_decode_prototype.py --bench  (parity vs dense reference, then
-B=64/L=8k timing). Measured on GH200: 0.73 ms/layer vs 0.85 ms dense SDPA at 8k/B=64.
-See the module docstring below for the cache row layout.
-"""
 """Phase A: decode attention over a TPA-factorized KV cache (standalone).
 
 Cache row per token (bf16), offsets:
@@ -96,13 +90,13 @@ def _tpa_decode_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, o_ptr, SPLIT:
     hmask = offs_h < HQ
     m = tl.full([HQP], float("-inf"), tl.float32)
     for s in range(SPLIT):
-        m = tl.maximum(m, tl.load(part_m_ptr + (b * SPLIT + s) * HQP + offs_h))
+        m = tl.maximum(m, tl.load(part_m_ptr + (b * SPLIT + s) * HQP + offs_h, mask=hmask, other=float("-inf")))
     l = tl.zeros([HQP], tl.float32); acc = tl.zeros([HQP, D], tl.float32)
     for s in range(SPLIT):
-        ms = tl.load(part_m_ptr + (b * SPLIT + s) * HQP + offs_h)
-        w = tl.exp(ms - m)
-        l += w * tl.load(part_l_ptr + (b * SPLIT + s) * HQP + offs_h)
-        acc += w[:, None] * tl.load(part_o_ptr + ((b * SPLIT + s) * HQP + offs_h[:, None]) * D + offs_d[None, :])
+        ms = tl.load(part_m_ptr + (b * SPLIT + s) * HQP + offs_h, mask=hmask, other=float("-inf"))
+        w = tl.where(hmask, tl.exp(ms - m), 0.0)
+        l += w * tl.load(part_l_ptr + (b * SPLIT + s) * HQP + offs_h, mask=hmask, other=0.0)
+        acc += w[:, None] * tl.load(part_o_ptr + ((b * SPLIT + s) * HQP + offs_h[:, None]) * D + offs_d[None, :], mask=hmask[:, None], other=0.0)
     tl.store(o_ptr + b * HQ * D + offs_h[:, None] * D + offs_d[None, :], (acc / l[:, None]).to(tl.bfloat16), mask=hmask[:, None])
 
 
