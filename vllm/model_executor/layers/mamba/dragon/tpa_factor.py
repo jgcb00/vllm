@@ -546,6 +546,7 @@ def factor_decode_attention(
     if out is None:
         out = torch.empty(B, HQ * HEAD_DIM, dtype=q.dtype, device=q.device)
     assert out.is_contiguous() and out.shape == (B, HQ * HEAD_DIM)
-    _factor_combine_kernel[(B, HQP // 16)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=16, D=HEAD_DIM,
-                                           CHUNK=min(8, nsplit), num_warps=4)
+    # 8 heads per program and up to 16 splits in flight: the merge of a single long request (128 splits) is latency-bound
+    _factor_combine_kernel[(B, HQP // 8)](part_o, part_m, part_l, nactive, out, SPLIT=nsplit, HQ_=HQ, HQP_=HQP, HB=8, D=HEAD_DIM,
+                                          CHUNK=min(16, nsplit), num_warps=4)
     return out
