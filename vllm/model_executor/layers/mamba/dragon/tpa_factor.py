@@ -20,9 +20,8 @@ rows per token (``[B (4x128) | C (12x4) | D (12x4)]`` for K and for V):
 runs a dedicated sm_90 kernel over the factors; prefill reconstructs the
 dense K/V of its context and runs FlashAttention varlen.
 
-Rows are stored globally pre-swizzled (16-byte chunk ``c`` of factor row
-``r`` at ``(c & 8) | ((c & 7) ^ r)``) so the kernel's ``ldmatrix`` loads are
-bank-conflict free with no padding.
+Rows are stored in plain ``[r][d]`` order; the decode kernel streams them
+with TMA tensor copies (128-byte swizzle) into the canonical wgmma layouts.
 """
 
 from __future__ import annotations
@@ -259,19 +258,9 @@ class DragonTPAFactorCache(nn.Module, AttentionLayerBase):
 # --------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=None)
-def _swizzle_index(device: torch.device) -> torch.Tensor:
-    """(4, 128) gather index: out[r, i] = in[r, swz(i)]; the chunk XOR is an involution."""
-    i = torch.arange(HEAD_DIM, device=device)
-    c, e = i // 8, i % 8
-    r = torch.arange(RANK, device=device).view(RANK, 1)
-    return ((c & 8) | ((c & 7) ^ r)) * 8 + e
-
-
 def swizzle_b(b: torch.Tensor) -> torch.Tensor:
-    """(N, 4, 128) -> (N, 4, 128) in the kernel's chunk order (and back)."""
-    idx = _swizzle_index(b.device).unsqueeze(0).expand(b.shape[0], RANK, HEAD_DIM)
-    return torch.gather(b, 2, idx)
+    """Factor rows are stored in plain [r][d] order; the decode kernel's TMA copies apply the 128B swizzle."""
+    return b
 
 
 def factor_rows(
@@ -413,17 +402,13 @@ def _factor_decode_write_kernel(
 
     # ---- factor rows: heads 0..R-1 write Bk' row h (norm gain folded), heads R..2R-1 write Bv row h-R
     kw = (1.0 + tl.load(kw_ptr + offs).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
-    c = offs // 8
-    e = offs % 8
     if h < R:
         b = tl.load(bk_ptr + n * sb_n + h * D + offs).to(tl.float32)
-        dest = h * D + ((c & 8) | ((c & 7) ^ h)) * 8 + e
-        tl.store(kplane_ptr + crow + dest, (b * kw).to(kplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
+        tl.store(kplane_ptr + crow + h * D + offs, (b * kw).to(kplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
     elif h < 2 * R:
         hr = h - R
         b = tl.load(bv_ptr + n * sb_n + hr * D + offs)
-        dest = hr * D + ((c & 8) | ((c & 7) ^ hr)) * 8 + e
-        tl.store(vplane_ptr + crow + dest, b.to(vplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
+        tl.store(vplane_ptr + crow + hr * D + offs, b.to(vplane_ptr.dtype.element_ty), mask=valid & (offs >= 0))
 
     # ---- q heads of this kv group: norm + scalable-softmax scale (eager rounding points)
     qw = (1.0 + tl.load(qw_ptr + offs).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
@@ -482,7 +467,8 @@ def _load_kernel():
     ext = load(
         name="dragon_tpa_factor_decode",
         sources=[src],
-        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90,code=sm_90"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+        extra_ldflags=["-lcuda"],
         build_directory=build_dir,
         verbose=False,
     )
