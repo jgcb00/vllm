@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Side-channel backend for Dragon's Differential-TPA token shift.
+"""Side-channel backend for Olala's Differential-TPA token shift.
 
-Dragon's ``V`` layers mix the previous token's raw K/V into the current step:
+Olala's ``V`` layers mix the previous token's raw K/V into the current step:
 
     k_shifted = alpha_k * k_prev + (1 - alpha_k) * k_curr
     v_shifted = alpha_v * v_prev + (1 - alpha_v) * v_curr
@@ -26,9 +26,9 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.dragon_spec_utils import (
-    DragonSpecMetadata,
-    build_dragon_spec_metadata,
+from vllm.v1.attention.backends.olala_spec_utils import (
+    OlalaSpecMetadata,
+    build_olala_spec_metadata,
 )
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
@@ -37,14 +37,14 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 
-class DragonDiffTPABackend(AttentionBackend):
+class OlalaDiffTPABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "DRAGON_DIFF_TPA"
+        return "OLALA_DIFF_TPA"
 
     @staticmethod
-    def get_builder_cls() -> type["DragonDiffTPAMetadataBuilder"]:
-        return DragonDiffTPAMetadataBuilder
+    def get_builder_cls() -> type["OlalaDiffTPAMetadataBuilder"]:
+        return OlalaDiffTPAMetadataBuilder
 
     @classmethod
     def is_ssm(cls) -> bool:
@@ -52,7 +52,7 @@ class DragonDiffTPABackend(AttentionBackend):
 
 
 @dataclass
-class DragonDiffTPAMetadata:
+class OlalaDiffTPAMetadata:
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -77,10 +77,10 @@ class DragonDiffTPAMetadata:
 
     # Speculative decoding (verify batches, column-slot protocol). None when
     # spec decode is off or the batch has no decode rows.
-    spec: DragonSpecMetadata | None = None
+    spec: OlalaSpecMetadata | None = None
 
 
-class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadata]):
+class OlalaDiffTPAMetadataBuilder(AttentionMetadataBuilder[OlalaDiffTPAMetadata]):
     # The shift itself is a single cudagraph-friendly kernel for pure decode
     # batches; prefill gathers over variable-length chunks, so stay in the
     # decode-only capture regime.
@@ -116,7 +116,7 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
-    ) -> DragonDiffTPAMetadata:
+    ) -> OlalaDiffTPAMetadata:
         m = common_attn_metadata
 
         block_table_tensor = mamba_get_block_table_tensor(
@@ -139,7 +139,7 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
         )
 
         spec = (
-            build_dragon_spec_metadata(
+            build_olala_spec_metadata(
                 m,
                 block_table_tensor,
                 num_decodes,
@@ -165,7 +165,7 @@ class DragonDiffTPAMetadataBuilder(AttentionMetadataBuilder[DragonDiffTPAMetadat
             query_start_loc_p_cpu = qsl_cpu - qsl_cpu[0]
             state_indices_p_cpu = state_indices_tensor[num_decodes:].tolist()
 
-        return DragonDiffTPAMetadata(
+        return OlalaDiffTPAMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

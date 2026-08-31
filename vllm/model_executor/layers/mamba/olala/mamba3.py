@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dragon Mamba3 MIMO mixer.
+"""Olala Mamba3 MIMO mixer.
 
-Native port of ``DragonMamba3MimoFast`` from ``modeling_dragon.py``. The four
+Native port of ``OlalaMamba3MimoFast`` from ``modeling_olala.py``. The four
 temporal states (angle, ssm, k, v) live in vLLM's paged mamba state pool;
 per-request slots arrive as ``Mamba3AttentionMetadata.state_indices_tensor``
 from the MAMBA3 backend.
@@ -32,8 +32,8 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.dragon.norm import DragonNorm
-from vllm.model_executor.layers.mamba.dragon.state import (
+from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
+from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
     mamba3_state_shape,
 )
@@ -164,7 +164,7 @@ def _bc_norm_kernel(
     tl.store(out_ptr + pid * S + offs, (v * inv * w).to(out_ptr.dtype.element_ty))
 
 
-class DragonMamba3Mixer(PluggableLayer, MambaBase):
+class OlalaMamba3Mixer(PluggableLayer, MambaBase):
     """Mamba3 MIMO mixer over vLLM's paged recurrent state.
 
     State layout per request slot:
@@ -197,6 +197,8 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         self.rope_fraction = 0.5
         self.rotary_dim_divisor = 4
         self.A_floor = 1e-4
+        # Megatron clears the SSM state every `artificial_seq_len` tokens; 0 = off.
+        self.artificial_seq_len = int(getattr(config, "artificial_seq_len", 0) or 0)
         split = int(self.d_state * self.rope_fraction)
         if split % 2:
             split -= 1
@@ -241,8 +243,8 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
 
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)
-        self.B_norm = DragonNorm(self.d_state, eps=eps, zero_centered=zc)
-        self.C_norm = DragonNorm(self.d_state, eps=eps, zero_centered=zc)
+        self.B_norm = OlalaNorm(self.d_state, eps=eps, zero_centered=zc)
+        self.C_norm = OlalaNorm(self.d_state, eps=eps, zero_centered=zc)
 
         self.in_proj_mimo_x = nn.Parameter(
             torch.full(
@@ -286,7 +288,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             # Per-rank local-shard norm: each rank normalizes only its own
             # d_inner slice, which differs numerically from a global RMSNorm
             # but matches how the mixer output is split.
-            self.output_norm = DragonNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
+            self.output_norm = OlalaNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
             set_weight_attrs(self.output_norm.norm.weight, head_shard)
 
         # Register in the static forward-context table so the runner can find
@@ -312,12 +314,12 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         _, ssm_dtype, k_dtype, v_dtype = dtypes
         if ssm_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
-                f"Dragon mamba3 supports an fp32 or bf16 SSM state, got "
+                f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
                 f"{ssm_dtype}. Set --mamba-ssm-cache-dtype to float32 or auto."
             )
         if k_dtype != torch.bfloat16 or v_dtype != torch.bfloat16:
             raise ValueError(
-                f"Dragon mamba3 requires a bf16 key/value state, got "
+                f"Olala mamba3 requires a bf16 key/value state, got "
                 f"{k_dtype}/{v_dtype}. Leave --mamba-cache-dtype at auto with "
                 f"a bf16 model."
             )
@@ -338,7 +340,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         """``(num_tokens, hidden_size)`` in, ``(num_tokens, d_inner/tp)`` out.
 
         The state-dependent work runs outside the compiled graph as the
-        ``vllm::dragon_mamba3`` custom op, mirroring ``mamba_mixer2``.
+        ``vllm::olala_mamba3`` custom op, mirroring ``mamba_mixer2``.
         """
         out = torch.empty(
             hidden_states.shape[0],
@@ -346,7 +348,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        torch.ops.vllm.dragon_mamba3(
+        torch.ops.vllm.olala_mamba3(
             hidden_states, out, _encode_layer_name(self.prefix)
         )
         return out
@@ -366,7 +368,21 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
+            if md.decode_reset_slots is not None:
+                # These sequences sit exactly on an artificial_seq_len boundary,
+                # so they open a new segment: training gave them a zero state
+                # here. Only the affected rows are touched.
+                for pool in pools:
+                    pool[md.decode_reset_slots] = 0
             if md.spec is not None:
+                if self.artificial_seq_len > 0:
+                    raise NotImplementedError(
+                        "artificial_seq_len window resets are not implemented for "
+                        "speculative decode: a verify batch advances several "
+                        "positions at once, so a boundary inside the window would "
+                        "be missed. Disable spec decode or set "
+                        "artificial_seq_len = 0."
+                    )
                 self._decode_spec(hidden_states[:ndt], out[:ndt], md.spec, pools)
             else:
                 self._decode(
@@ -417,10 +433,12 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         pools: tuple[torch.Tensor, ...],
     ) -> None:
         # Fast path: every prompt starts from zero state, so one packed varlen
-        # launch covers the batch. DragonForCausalLMConfig disables chunked
+        # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
         if not md.has_initial_any:
-            self._prefill_zero_start(h, out, slots, md.query_start_loc_p, pools)
+            self._prefill_zero_start(
+                h, out, slots, md.query_start_loc_p, pools, win=md.win_segments
+            )
             return
 
         # Continuation chunks resume a cached state. With an Input_States-
@@ -430,12 +448,26 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         if _MIMO_SUPPORTS_INPUT_STATES:
             init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
             self._prefill_zero_start(
-                h, out, slots, md.query_start_loc_p, pools, init_states=init
+                h,
+                out,
+                slots,
+                md.query_start_loc_p,
+                pools,
+                init_states=init,
+                win=md.win_segments,
             )
             return
 
         # Legacy kernel: split zero-start sequences (one packed varlen call)
         # from continuations (serial per-token recurrence).
+        if md.win_segments is not None:
+            # This path re-packs and rebases cu_seqlens, which invalidates the
+            # absolute window offsets computed by the builder.
+            raise NotImplementedError(
+                "artificial_seq_len window resets need an Input_States-capable "
+                "mamba3_mimo (mamba_ssm with mimo_input_state). Upgrade mamba_ssm "
+                "or set artificial_seq_len = 0."
+            )
         has_init = md.has_initial_state_cpu
         qsl_cpu = md.query_start_loc_p_cpu
         zero_idxs = [i for i in range(has_init.numel()) if not has_init[i]]
@@ -535,6 +567,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         qsl: torch.Tensor,  # (P+1,) rebased to 0
         pools: tuple[torch.Tensor, ...],
         init_states: tuple[torch.Tensor, ...] | None = None,
+        win: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
@@ -578,6 +611,20 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             self._prefill_const_w = cw
         q_bias, k_bias, mimo_v, mimo_z, mimo_out, d_f32 = cw
 
+        # artificial_seq_len: split each request at absolute multiples of the
+        # window, exactly as training does. The carried state seeds only a
+        # request's FIRST sub-segment; every later one starts after a reset,
+        # i.e. from zero.
+        cu_seqlens = qsl.to(torch.int32)
+        if win is not None:
+            cu_seqlens, seg_owner, seg_seed, seg_last = win
+            if init_states is not None:
+                init_states = tuple(
+                    t[seg_owner]
+                    * seg_seed.view(-1, *([1] * (t.dim() - 1))).to(t.dtype)
+                    for t in init_states
+                )
+
         Out, Final_Angle, Final_SSM, Final_K, _ = _mamba3_mimo(
             Q=C.contiguous().bfloat16(),
             K=B.contiguous().bfloat16(),
@@ -597,9 +644,17 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
             return_state=True,
-            cu_seqlens=qsl.to(torch.int32),
+            cu_seqlens=cu_seqlens,
             **({"Input_States": init_states} if init_states is not None else {}),
         )
+
+        # With windows the kernel returns one state per SUB-segment; a request
+        # continues from its last one (everything before the final boundary is
+        # what the reset deliberately forgets).
+        if win is not None:
+            Final_Angle = Final_Angle[seg_last]
+            Final_SSM = Final_SSM[seg_last]
+            Final_K = Final_K[seg_last]
 
         # The kernel's Final_V is taken at the global last token, which is
         # wrong for a packed varlen batch — recompute it per sequence.
@@ -623,7 +678,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         would silently blend old and new weights.
 
         The snapshots are refreshed IN PLACE rather than dropped. FULL-mode
-        CUDA graphs capture ``_decode`` (inside the ``dragon_mamba3`` op) and
+        CUDA graphs capture ``_decode`` (inside the ``olala_mamba3`` op) and
         bake the snapshot tensors' raw device addresses into every captured
         decode graph. Dropping the cache frees those tensors; once the
         caching allocator reuses or releases the segment, every subsequent
@@ -685,7 +740,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         self,
         u: torch.Tensor,  # (ndt, D) — all decode tokens, ragged per request
         out: torch.Tensor,  # (ndt, d_inner_local)
-        spec,  # DragonSpecMetadata
+        spec,  # OlalaSpecMetadata
         pools: tuple[torch.Tensor, ...],
     ) -> None:
         """Speculative verify: chain the dual-slot step kernel over positions.
@@ -702,7 +757,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         R, S = self.mimo_dim, self.d_state
         if not (self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)):
             raise NotImplementedError(
-                "Dragon spec decode requires ngroups == 1 and power-of-two "
+                "Olala spec decode requires ngroups == 1 and power-of-two "
                 "headdim/d_state (the fused preamble shapes)."
             )
         assert self.headdim <= _STEP_TILE_D
@@ -949,7 +1004,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             out.copy_(y.to(out.dtype))
 
 
-def dragon_mamba3(
+def olala_mamba3(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
@@ -959,7 +1014,7 @@ def dragon_mamba3(
     self._forward_impl(hidden_states, output)
 
 
-def dragon_mamba3_fake(
+def olala_mamba3_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
@@ -968,8 +1023,8 @@ def dragon_mamba3_fake(
 
 
 direct_register_custom_op(
-    op_name="dragon_mamba3",
-    op_func=dragon_mamba3,
+    op_name="olala_mamba3",
+    op_func=olala_mamba3,
     mutates_args=["output"],
-    fake_impl=dragon_mamba3_fake,
+    fake_impl=olala_mamba3_fake,
 )

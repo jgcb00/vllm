@@ -806,7 +806,7 @@ def get_model_params(config):
         topk = config.moe_topk[0]
         intermediate_size = config.moe_intermediate_size[0]
         hidden_size = config.hidden_size
-    elif architecture == "DragonForCausalLM":
+    elif architecture == "OlalaForCausalLM":
         E = config.moe_num_routed_experts
         topk = config.moe_num_active_experts
         intermediate_size = config.moe_routed_intermediate_size

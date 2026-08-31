@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dragon Differential-TPA attention mixer.
+"""Olala Differential-TPA attention mixer.
 
-Native port of ``DragonDifferentialTensorProductAttentionV2``:
+Native port of ``OlalaDifferentialTensorProductAttentionV2``:
 
 * TPA low-rank K/V reconstruction — ``key = (A_k @ B_k) / rank``, where
   ``A_k``/``A_v`` are per-head coefficients and ``B_k``/``B_v`` shared bases.
 * Optional token-shift EMA mixing of the previous token's raw K/V. The
   one-token ``(k_last, v_last)`` buffer is owned by a side-channel
-  ``DRAGON_DIFF_TPA`` mamba backend so vLLM's state manager pages it.
+  ``OLALA_DIFF_TPA`` mamba backend so vLLM's state manager pages it.
 * Softmax attention over vLLM's paged KV through ``Attention``.
 * Differential recombination — heads split into ``snr`` signal heads plus one
   noise head per group, combined as ``sig - sigmoid(lambda) * noise``.
 
 Not ported (the reference model's optional paths): ``token_conv1d_attn``,
 ``xsa``, ``intra_doc_masking``, value embeddings, per-layer sliding window,
-and Dragon's custom p-rope (vLLM's ``get_rope`` is used instead).
+and Olala's custom p-rope (vLLM's ``get_rope`` is used instead).
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.dragon.norm import DragonNorm
-from vllm.model_executor.layers.mamba.dragon.state import (
+from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
+from vllm.model_executor.layers.mamba.olala.state import (
     token_shift_state_dtype,
     token_shift_state_shape,
 )
@@ -48,7 +48,7 @@ from vllm.utils.torch_utils import (
     _resolve_layer_name,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backends.dragon_diff_tpa_attn import DragonDiffTPAMetadata
+from vllm.v1.attention.backends.olala_diff_tpa_attn import OlalaDiffTPAMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 
@@ -119,7 +119,7 @@ def _token_shift_decode_kernel(
     )
 
 
-class DragonTokenShiftState(nn.Module, MambaBase):
+class OlalaTokenShiftState(nn.Module, MambaBase):
     """Owner of the per-request one-token ``(k_last, v_last)`` buffer.
 
     Modelled as a ``MambaBase`` layer purely so vLLM's paged state manager
@@ -151,7 +151,7 @@ class DragonTokenShiftState(nn.Module, MambaBase):
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.DRAGON_DIFF_TPA
+        return MambaAttentionBackendEnum.OLALA_DIFF_TPA
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return token_shift_state_dtype(
@@ -167,7 +167,7 @@ class DragonTokenShiftState(nn.Module, MambaBase):
         )
 
 
-class DragonDiffTPAAttention(PluggableLayer):
+class OlalaDiffTPAAttention(PluggableLayer):
     """Differential tensor-product attention over vLLM's paged KV."""
 
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = ""):
@@ -176,9 +176,9 @@ class DragonDiffTPAAttention(PluggableLayer):
         self.prefix = prefix
         tp = get_tensor_model_parallel_world_size()
         self.tp_size = tp
-        # Register under our own prefix so the vllm::dragon_diff_tpa custom op
+        # Register under our own prefix so the vllm::olala_diff_tpa custom op
         # can resolve this layer from the forward context. Distinct from the
-        # nested Attention (.attn) and DragonTokenShiftState (.shift_state)
+        # nested Attention (.attn) and OlalaTokenShiftState (.shift_state)
         # registrations.
         compilation = get_current_vllm_config().compilation_config
         if prefix in compilation.static_forward_context:
@@ -188,7 +188,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         for flag in ("token_conv1d_attn", "xsa", "intra_doc_masking"):
             if getattr(config, flag, False):
                 raise NotImplementedError(
-                    f"DragonDiffTPAAttention: config.{flag} is not supported"
+                    f"OlalaDiffTPAAttention: config.{flag} is not supported"
                 )
 
         self.hidden_size = config.hidden_size
@@ -205,7 +205,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         self.num_noise_heads = self.num_attention_heads - self.num_signal_heads
         if self.num_noise_heads <= 0 or self.num_signal_heads % self.num_noise_heads:
             raise ValueError(
-                f"DragonDiffTPAAttention: num_signal_heads="
+                f"OlalaDiffTPAAttention: num_signal_heads="
                 f"{self.num_signal_heads} must be a positive multiple of "
                 f"num_noise_heads={self.num_noise_heads}"
             )
@@ -219,7 +219,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         ):
             if count % tp:
                 raise ValueError(
-                    f"DragonDiffTPAAttention: {name}={count} is not divisible "
+                    f"OlalaDiffTPAAttention: {name}={count} is not divisible "
                     f"by tensor_parallel_size={tp}"
                 )
         self.num_attention_heads_local = divide(self.num_attention_heads, tp)
@@ -268,7 +268,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         if self.token_shift:
             self.shift_proj_k = column(self.num_kv_heads, "shift_proj_k")
             self.shift_proj_v = column(self.num_kv_heads, "shift_proj_v")
-            self.shift_state = DragonTokenShiftState(
+            self.shift_state = OlalaTokenShiftState(
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
                 vllm_config=vllm_config,
@@ -280,8 +280,8 @@ class DragonDiffTPAAttention(PluggableLayer):
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)
         if self.qk_norm:
-            self.q_norm = DragonNorm(self.head_dim, eps=eps, zero_centered=zc)
-            self.k_norm = DragonNorm(self.head_dim, eps=eps, zero_centered=zc)
+            self.q_norm = OlalaNorm(self.head_dim, eps=eps, zero_centered=zc)
+            self.k_norm = OlalaNorm(self.head_dim, eps=eps, zero_centered=zc)
 
         rope_theta = float(getattr(config, "rope_theta", 0.0) or 0.0)
         if rope_theta > 0.0:
@@ -297,7 +297,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         else:
             self.rotary_emb = None
 
-        # Dragon scales by 1/head_dim under use_completed_p, else 1/sqrt(d).
+        # Olala scales by 1/head_dim under use_completed_p, else 1/sqrt(d).
         scale = (
             1.0 / self.head_dim
             if getattr(config, "use_completed_p", False)
@@ -320,7 +320,7 @@ class DragonDiffTPAAttention(PluggableLayer):
     ) -> torch.Tensor:
         """Return the differential output, ``(N, num_signal_heads_local*D)``.
 
-        Runs outside the compiled graph as the ``vllm::dragon_diff_tpa``
+        Runs outside the compiled graph as the ``vllm::olala_diff_tpa``
         custom op: the token shift mutates paged state, and the inner paged
         attention is itself an out-of-graph op.
         """
@@ -330,7 +330,7 @@ class DragonDiffTPAAttention(PluggableLayer):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        torch.ops.vllm.dragon_diff_tpa(
+        torch.ops.vllm.olala_diff_tpa(
             positions, hidden_states, out, _encode_layer_name(self.prefix)
         )
         return out
@@ -414,7 +414,7 @@ class DragonDiffTPAAttention(PluggableLayer):
             a_v = torch.sigmoid(alpha_v_all.float()).unsqueeze(-1).to(v.dtype)
             return (1 - a_k) * k, (1 - a_v) * v
 
-        md: DragonDiffTPAMetadata = attn_metadata[self.shift_state.prefix]
+        md: OlalaDiffTPAMetadata = attn_metadata[self.shift_state.prefix]
         k_pool, v_pool = self.shift_state.kv_cache
         slots = md.state_indices_tensor
         nd, np_ = md.num_decodes, md.num_prefills
@@ -541,7 +541,7 @@ class DragonDiffTPAAttention(PluggableLayer):
 
     def _shift_spec_rows(
         self,
-        spec,  # DragonSpecMetadata
+        spec,  # OlalaSpecMetadata
         k: torch.Tensor,
         v: torch.Tensor,
         k_pool: torch.Tensor,
@@ -632,7 +632,7 @@ class DragonDiffTPAAttention(PluggableLayer):
 
     def _shift_prefill_rows(
         self,
-        md: DragonDiffTPAMetadata,
+        md: OlalaDiffTPAMetadata,
         k: torch.Tensor,
         v: torch.Tensor,
         slots: torch.Tensor,
@@ -690,7 +690,7 @@ class DragonDiffTPAAttention(PluggableLayer):
         )
 
 
-def dragon_diff_tpa(
+def olala_diff_tpa(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -701,7 +701,7 @@ def dragon_diff_tpa(
     self._forward_impl(positions, hidden_states, output)
 
 
-def dragon_diff_tpa_fake(
+def olala_diff_tpa_fake(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     output: torch.Tensor,
@@ -711,8 +711,8 @@ def dragon_diff_tpa_fake(
 
 
 direct_register_custom_op(
-    op_name="dragon_diff_tpa",
-    op_func=dragon_diff_tpa,
+    op_name="olala_diff_tpa",
+    op_func=olala_diff_tpa,
     mutates_args=["output"],
-    fake_impl=dragon_diff_tpa_fake,
+    fake_impl=olala_diff_tpa_fake,
 )

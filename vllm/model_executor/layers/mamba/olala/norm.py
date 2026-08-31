@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dragon's RMS norm, kept bit-compatible with the reference checkpoint.
+"""Olala's RMS norm, kept bit-compatible with the reference checkpoint.
 
-Dragon stores every norm as ``<name>.norm.weight``: a ``DragonNorm`` wrapper
-around a ``DragonRMSNorm``. vLLM's own ``RMSNorm`` cannot be substituted
+Olala stores every norm as ``<name>.norm.weight``: a ``OlalaNorm`` wrapper
+around a ``OlalaRMSNorm``. vLLM's own ``RMSNorm`` cannot be substituted
 because it would change the parameter path and does not implement the
-zero-centered (``weight + 1``) variant Dragon trains with.
+zero-centered (``weight + 1``) variant Olala trains with.
 """
 
 import torch
 from torch import nn
 
 
-class DragonRMSNorm(nn.Module):
+class OlalaRMSNorm(nn.Module):
     """RMS norm with an optionally zero-centered gain."""
 
     def __init__(self, hidden_size: int, eps: float, zero_centered: bool):
@@ -33,12 +33,12 @@ class DragonRMSNorm(nn.Module):
         return y * self.weight
 
 
-class DragonNorm(nn.Module):
+class OlalaNorm(nn.Module):
     """Checkpoint-shaped wrapper: exposes the gain at ``<name>.norm.weight``."""
 
     def __init__(self, hidden_size: int, *, eps: float, zero_centered: bool):
         super().__init__()
-        self.norm = DragonRMSNorm(hidden_size, eps=eps, zero_centered=zero_centered)
+        self.norm = OlalaRMSNorm(hidden_size, eps=eps, zero_centered=zero_centered)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(x)
