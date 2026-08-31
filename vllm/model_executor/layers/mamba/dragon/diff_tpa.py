@@ -712,8 +712,8 @@ class DragonDiffTPAAttention(PluggableLayer):
 
     def _decode_proj_weight(self) -> torch.Tensor:
         """Concatenated [c_q; W_A_k; W_A_v; W_B_k; W_B_v; lambda_proj] weights
-        for the single-token GEMV; built once, dropped by
-        invalidate_weight_caches() after an in-place weight reload."""
+        for the single-token GEMV; built once, refreshed in place by
+        refresh_weight_caches() after an in-place weight reload."""
         w = getattr(self, "_decode_proj_w", None)
         if w is None:
             mods = (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
@@ -725,8 +725,24 @@ class DragonDiffTPAAttention(PluggableLayer):
             self._decode_proj_w = w
         return w
 
-    def invalidate_weight_caches(self) -> None:
-        self._decode_proj_w = None
+    def refresh_weight_caches(self) -> None:
+        """Recompute the concatenated-projection snapshot into its existing
+        storage: FULL-mode CUDA graphs bake its device address into the
+        captured decode graphs (same failure mode as the Mamba3 constant
+        caches under RL weight resync)."""
+        w = getattr(self, "_decode_proj_w", None)
+        if w is None:
+            return
+        mods = (self.c_q, self.W_A_k, self.W_A_v, self.W_B_k,
+                self.W_B_v, self.lambda_proj)
+        if self.token_shift:
+            mods = mods + (self.shift_proj_k, self.shift_proj_v)
+        with torch.inference_mode():
+            off = 0
+            for m in mods:
+                n = m.weight.shape[0]
+                w[off : off + n].copy_(m.weight)
+                off += n
 
     def _apply_token_shift(
         self,

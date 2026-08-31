@@ -326,7 +326,7 @@ class DragonLatentMoE(nn.Module):
         ``w_in = [fc1_latent ; shared_up]`` shares the input GEMV and
         ``w_out = [fc2_latent | shared_down]`` folds the shared+routed add into
         one K-concatenated GEMV. Built once from the live parameters; call
-        invalidate_weight_caches() after an in-place weight reload.
+        refresh_weight_caches() after an in-place weight reload.
         """
         if self._small_w is None:
             w_in = torch.cat(
@@ -338,8 +338,20 @@ class DragonLatentMoE(nn.Module):
             self._small_w = (w_in, w_out)
         return self._small_w
 
-    def invalidate_weight_caches(self) -> None:
-        self._small_w = None
+    def refresh_weight_caches(self) -> None:
+        """Recompute the concatenated small-path projections into their
+        existing storage (CUDA graphs bake their addresses; see the Mamba3
+        mixer's refresh_weight_caches)."""
+        if self._small_w is None:
+            return
+        w_in, w_out = self._small_w
+        with torch.inference_mode():
+            n1 = self.fc1_latent_proj.weight.shape[0]
+            w_in[:n1].copy_(self.fc1_latent_proj.weight)
+            w_in[n1:].copy_(self.shared_experts.up_proj.weight)
+            k1 = self.fc2_latent_proj.weight.shape[1]
+            w_out[:, :k1].copy_(self.fc2_latent_proj.weight)
+            w_out[:, k1:].copy_(self.shared_experts.down_proj.weight)
 
 
 @triton.jit
@@ -1036,7 +1048,7 @@ class DragonForCausalLM(
 
         self._maybe_prenormalize_embeddings()
         for module in self.modules():
-            if isinstance(module, DragonMamba3Mixer):
+            if isinstance(module, (DragonMamba3Mixer, DragonDiffTPAAttention, DragonLatentMoE)):
                 module.refresh_weight_caches()
         return loaded
 

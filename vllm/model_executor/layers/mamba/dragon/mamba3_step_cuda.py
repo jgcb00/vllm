@@ -52,7 +52,7 @@ def cuda_step_supported(ssm_pool, k_pool, v_pool, angle_pool, B, C, angle, num_h
     )
 
 
-_F32_CACHE: dict[int, torch.Tensor] = {}
+_F32_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _fp32(w: torch.Tensor) -> torch.Tensor:
@@ -60,11 +60,19 @@ def _fp32(w: torch.Tensor) -> torch.Tensor:
     if w.dtype == torch.float32:
         return w
     key = w.data_ptr()
-    t = _F32_CACHE.get(key)
-    if t is None:
-        t = w.detach().float().contiguous()
-        _F32_CACHE[key] = t
-    return t
+    e = _F32_CACHE.get(key)
+    if e is None:
+        e = (w, w.detach().float().contiguous())
+        _F32_CACHE[key] = e
+    return e[1]
+
+
+def refresh_f32_cache() -> None:
+    """Recompute the cached fp32 copies after an in-place weight reload
+    (their addresses are baked into captured CUDA graphs)."""
+    with torch.inference_mode():
+        for src, dst in _F32_CACHE.values():
+            dst.copy_(src.detach().float())
 
 
 def _as_f32(t: torch.Tensor) -> torch.Tensor:

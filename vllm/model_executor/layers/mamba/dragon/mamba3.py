@@ -32,6 +32,7 @@ from vllm.model_executor.layers.mamba.dragon.mamba3_step_cuda import (
     cuda_step_enabled,
     cuda_step_supported,
     mamba3_step_cuda,
+    refresh_f32_cache,
 )
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
@@ -793,6 +794,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
                     ),
                 ):
                     dst.copy_(src)
+            refresh_f32_cache()
             w = self._in_proj_cat_w
             if w is not None:
                 n1 = self.in_proj.weight.shape[0]
