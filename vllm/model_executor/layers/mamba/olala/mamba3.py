@@ -197,8 +197,6 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self.rope_fraction = 0.5
         self.rotary_dim_divisor = 4
         self.A_floor = 1e-4
-        # Megatron clears the SSM state every `artificial_seq_len` tokens; 0 = off.
-        self.artificial_seq_len = int(getattr(config, "artificial_seq_len", 0) or 0)
         split = int(self.d_state * self.rope_fraction)
         if split % 2:
             split -= 1
@@ -368,21 +366,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
-            if md.decode_reset_slots is not None:
-                # These sequences sit exactly on an artificial_seq_len boundary,
-                # so they open a new segment: training gave them a zero state
-                # here. Only the affected rows are touched.
-                for pool in pools:
-                    pool[md.decode_reset_slots] = 0
             if md.spec is not None:
-                if self.artificial_seq_len > 0:
-                    raise NotImplementedError(
-                        "artificial_seq_len window resets are not implemented for "
-                        "speculative decode: a verify batch advances several "
-                        "positions at once, so a boundary inside the window would "
-                        "be missed. Disable spec decode or set "
-                        "artificial_seq_len = 0."
-                    )
                 self._decode_spec(hidden_states[:ndt], out[:ndt], md.spec, pools)
             else:
                 self._decode(
@@ -436,9 +420,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
         if not md.has_initial_any:
-            self._prefill_zero_start(
-                h, out, slots, md.query_start_loc_p, pools, win=md.win_segments
-            )
+            self._prefill_zero_start(h, out, slots, md.query_start_loc_p, pools)
             return
 
         # Continuation chunks resume a cached state. With an Input_States-
@@ -448,26 +430,12 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if _MIMO_SUPPORTS_INPUT_STATES:
             init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
             self._prefill_zero_start(
-                h,
-                out,
-                slots,
-                md.query_start_loc_p,
-                pools,
-                init_states=init,
-                win=md.win_segments,
+                h, out, slots, md.query_start_loc_p, pools, init_states=init
             )
             return
 
         # Legacy kernel: split zero-start sequences (one packed varlen call)
         # from continuations (serial per-token recurrence).
-        if md.win_segments is not None:
-            # This path re-packs and rebases cu_seqlens, which invalidates the
-            # absolute window offsets computed by the builder.
-            raise NotImplementedError(
-                "artificial_seq_len window resets need an Input_States-capable "
-                "mamba3_mimo (mamba_ssm with mimo_input_state). Upgrade mamba_ssm "
-                "or set artificial_seq_len = 0."
-            )
         has_init = md.has_initial_state_cpu
         qsl_cpu = md.query_start_loc_p_cpu
         zero_idxs = [i for i in range(has_init.numel()) if not has_init[i]]
@@ -567,7 +535,6 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         qsl: torch.Tensor,  # (P+1,) rebased to 0
         pools: tuple[torch.Tensor, ...],
         init_states: tuple[torch.Tensor, ...] | None = None,
-        win: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
@@ -611,20 +578,6 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self._prefill_const_w = cw
         q_bias, k_bias, mimo_v, mimo_z, mimo_out, d_f32 = cw
 
-        # artificial_seq_len: split each request at absolute multiples of the
-        # window, exactly as training does. The carried state seeds only a
-        # request's FIRST sub-segment; every later one starts after a reset,
-        # i.e. from zero.
-        cu_seqlens = qsl.to(torch.int32)
-        if win is not None:
-            cu_seqlens, seg_owner, seg_seed, seg_last = win
-            if init_states is not None:
-                init_states = tuple(
-                    t[seg_owner]
-                    * seg_seed.view(-1, *([1] * (t.dim() - 1))).to(t.dtype)
-                    for t in init_states
-                )
-
         Out, Final_Angle, Final_SSM, Final_K, _ = _mamba3_mimo(
             Q=C.contiguous().bfloat16(),
             K=B.contiguous().bfloat16(),
@@ -644,17 +597,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             rotary_dim_divisor=self.rotary_dim_divisor,
             dtype=x.dtype,
             return_state=True,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=qsl.to(torch.int32),
             **({"Input_States": init_states} if init_states is not None else {}),
         )
-
-        # With windows the kernel returns one state per SUB-segment; a request
-        # continues from its last one (everything before the final boundary is
-        # what the reset deliberately forgets).
-        if win is not None:
-            Final_Angle = Final_Angle[seg_last]
-            Final_SSM = Final_SSM[seg_last]
-            Final_K = Final_K[seg_last]
 
         # The kernel's Final_V is taken at the global last token, which is
         # wrong for a packed varlen batch — recompute it per sequence.
