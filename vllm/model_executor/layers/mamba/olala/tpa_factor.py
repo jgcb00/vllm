@@ -473,21 +473,13 @@ def factor_decode_write(
 
 @lru_cache(maxsize=1)
 def _load_kernel():
-    from torch.utils.cpp_extension import load
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "tpa_factor_decode.cu")
-    build_dir = os.environ.get(
-        "OLALA_TPA_BUILD_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "olala_tpa_factor"),
-    )
-    os.makedirs(build_dir, exist_ok=True)
-    ext = load(
-        name="olala_tpa_factor_decode",
-        sources=[src],
-        extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
-        extra_ldflags=["-lcuda"],
-        build_directory=build_dir,
-        verbose=False,
+    ext = load_extension(
+        "olala_tpa_factor_decode",
+        "tpa_factor_decode.cu",
+        ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+        ["-lcuda"],
     )
     assert ext.TILE == TILE
     return ext

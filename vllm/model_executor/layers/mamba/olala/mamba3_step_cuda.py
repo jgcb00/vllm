@@ -46,20 +46,12 @@ def cuda_step_enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def _load():
-    from torch.utils.cpp_extension import load
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "mamba3_step.cu")
-    build_dir = os.environ.get(
-        "OLALA_TPA_BUILD_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "olala_tpa_factor"),
-    )
-    os.makedirs(build_dir, exist_ok=True)
-    return load(
-        name="olala_mamba3_step",
-        sources=[src],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90,code=sm_90"],
-        build_directory=build_dir,
-        verbose=False,
+    return load_extension(
+        "olala_mamba3_step",
+        "mamba3_step.cu",
+        ["-O3", "-std=c++17", "-gencode=arch=compute_90,code=sm_90"],
     )
 
 
