@@ -92,9 +92,11 @@ def test_grouped_prefill_matches_single_pass():
         mamba3_mimo_varlen_grouped,
     )
 
-    kw = _inputs([5000, 200, 4200], seed=1)
+    kw = _inputs([5000, 200, 4200], seed=1)  # forced split (auto_split=False)
     ref = mamba3_mimo(**kw, return_state=True)
-    got = mamba3_mimo_varlen_grouped(**kw, cu_seqlens_cpu=kw["cu_seqlens"].cpu())
+    got = mamba3_mimo_varlen_grouped(
+        **kw, cu_seqlens_cpu=kw["cu_seqlens"].cpu(), auto_split=False
+    )
     for g, r in zip(got, ref):
         _close(g, r, 2e-2)
 
@@ -155,3 +157,24 @@ def test_cuda_step_matches_cute_step(state_dtype: torch.dtype):
     _close(got["ang"], ref["ang"], 1e-5)
     for k in ("kp", "vp"):
         _close(got[k], ref[k], 2e-2)
+
+
+@pytest.mark.parametrize(
+    "lens,expected",
+    [
+        ([4096], False),
+        ([8192], True),
+        ([24576], True),
+        ([24576, 128, 300], True),  # short neighbours do not block the split
+        ([8192, 8192], False),
+        ([12288, 12288], True),
+        ([8192, 8192, 8192], False),
+    ],
+)
+def test_split_policy(lens: list[int], expected: bool, monkeypatch):
+    """Grouped prefill only splits when the single pass under-fills the GPU
+    (decisions measured on GH200: 132 SMs, 48 heads)."""
+    from vllm.model_executor.layers.mamba.ops.mamba3 import mimo
+
+    monkeypatch.setattr(mimo, "_sm_count", lambda device: 132)
+    assert mimo._split_pays(lens, H, torch.device("cuda")) is expected

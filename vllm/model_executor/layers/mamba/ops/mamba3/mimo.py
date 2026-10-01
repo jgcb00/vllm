@@ -11,6 +11,7 @@ the packed varlen layout vLLM uses; ``mamba3_mimo_varlen_grouped`` is the
 group-parallel exact prefill for long sequences (same contract).
 """
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -98,6 +99,28 @@ def mamba3_mimo(
             Final_K.contiguous(), V[0, ends].contiguous())
 
 
+@functools.cache
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _split_pays(lens: list[int], nheads: int, device: torch.device) -> bool:
+    """Whether the two-pass split beats the single pass.
+
+    The single pass runs one block per (head, sequence), so its time is set by
+    the longest sequence, and only sequences within ~4x of it matter. The split
+    doubles the work, so it pays only while those long sequences leave SMs
+    idle and are long enough to amortize the second pass. Measured on GH200
+    (H=48): 1x8192 4.75 -> 3.5 ms, 1x24576 14.0 -> 5.9, 2x12288 6.9 -> 5.9,
+    but 2x8192 4.7 -> 5.1, 3x8192 5.1 -> 6.8, 4x8192 5.2 -> 7.4.
+    """
+    if not lens:
+        return False
+    l_max = max(lens)
+    n_long = sum(4 * n >= l_max for n in lens)
+    return nheads * n_long <= _sm_count(device) and l_max >= 6144 * n_long
+
+
 @torch.no_grad()
 def mamba3_mimo_varlen_grouped(
     Q: Tensor,
@@ -127,6 +150,7 @@ def mamba3_mimo_varlen_grouped(
     outproj_norm_eps: float = 1e-5,
     threads: int = 128,
     num_stages: int = 0,
+    auto_split: bool = True,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Group-parallel exact prefill: same math as ``mamba3_mimo`` (varlen,
     ``return_state=True``), restructured for GPU occupancy on long prompts.
@@ -152,6 +176,10 @@ def mamba3_mimo_varlen_grouped(
     Group boundaries reuse the battle-tested chunked-prefill ``Input_States``
     machinery, so numerics match the single-pass kernel to bf16 rounding.
 
+    With ``auto_split`` (default) the batch is only split when the single
+    pass leaves the GPU idle (see ``_split_pays``); otherwise this is exactly
+    the single-pass call.
+
     Returns ``(Out, Final_Angle, Final_SSM, Final_K, Final_V)`` — the exact
     contract of ``mamba3_mimo(..., return_state=True)``.
     """
@@ -174,6 +202,10 @@ def mamba3_mimo_varlen_grouped(
     # cu_seqlens_cpu (when given) avoids a device sync for the host-side split.
     cu_list = (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens).tolist()
     ns_true = len(cu_list) - 1
+    if auto_split and not _split_pays(
+        [cu_list[i + 1] - cu_list[i] for i in range(ns_true)], V.shape[-2], V.device
+    ):
+        min_split_tokens = cu_list[-1] + 1  # nothing qualifies: single pass
     v_bounds = [0]           # virtual cu_seqlens
     seq_of_group: list[int] = []
     last_group_rows = [0] * ns_true
