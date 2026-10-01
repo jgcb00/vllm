@@ -8,14 +8,14 @@ per-request slots arrive as ``Mamba3AttentionMetadata.state_indices_tensor``
 from the MAMBA3 backend.
 
 Prefill packs the batch into ``(B=1, S=total_tokens)`` and calls the TileLang
-varlen kernel ``mamba_ssm.ops.tilelang.mamba3.mamba3_mimo`` with
-``cu_seqlens``. Decode runs the packed CuteDSL ``mamba3_step_fn`` over the
-whole decode-token batch, indexing the state pools in place.
+varlen kernel ``ops.mamba3.mimo.mamba3_mimo`` with ``cu_seqlens``. Decode runs
+the persistent CUDA step (``mamba3_step_cuda``) or the CuteDSL
+``ops.mamba3.step_cute.mamba3_step_fn`` over the whole decode-token batch,
+indexing the state pools in place.
 """
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
 
@@ -70,16 +70,12 @@ _STEP_NUM_WARPS = 4
 # batch size; each cudagraph capture size takes one consistent branch.
 _FUSE_ROTARY_MAX_BATCH = 64
 
-# External Mamba3 kernels (from the official ``mamba_ssm`` package), imported
-# lazily so this module stays importable on hosts without them.
+# Mamba3 kernels (vendored under ops/mamba3), imported lazily: the prefill
+# kernel needs tilelang and the step kernel the CuTe DSL.
 _mamba3_mimo = None
 _mamba3_mimo_grouped = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
-# True when mamba3_mimo accepts Input_States (mamba_ssm mimo_input_state
-# merge): continuation prefills then run as one packed varlen call instead of
-# a serial per-token recurrence.
-_MIMO_SUPPORTS_INPUT_STATES = False
 
 
 def _is_pow2(n: int) -> bool:
@@ -88,35 +84,28 @@ def _is_pow2(n: int) -> bool:
 
 def _lazy_import_kernels() -> None:
     global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn
-    global _apply_rotary_qk_inference_fwd, _MIMO_SUPPORTS_INPUT_STATES
+    global _apply_rotary_qk_inference_fwd
     if _mamba3_mimo is not None:
         return
-    import inspect
-
-    from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
-    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo
-    from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
+    from vllm.model_executor.layers.mamba.ops.mamba3.mimo import (
+        mamba3_mimo,
+        mamba3_mimo_varlen_grouped,
+    )
+    from vllm.model_executor.layers.mamba.ops.mamba3.rotary_step import (
         apply_rotary_qk_inference_fwd,
+    )
+    from vllm.model_executor.layers.mamba.ops.mamba3.step_cute import (
+        mamba3_step_fn,
     )
 
     _mamba3_mimo = mamba3_mimo
     _mamba3_step_fn = mamba3_step_fn
     _apply_rotary_qk_inference_fwd = apply_rotary_qk_inference_fwd
-    _MIMO_SUPPORTS_INPUT_STATES = (
-        "Input_States" in inspect.signature(mamba3_mimo).parameters
-    )
-    # Group-parallel exact prefill (mamba_ssm mamba3-prefill-opt): splits long
-    # sequences into virtual groups for GPU occupancy — same math, ~1.4x on
-    # long prompts. Disable with OLALA_GROUPED_PREFILL=0.
+    # Group-parallel exact prefill: splits long sequences into virtual groups
+    # for GPU occupancy — same math, ~1.4x on long prompts. Disable with
+    # OLALA_GROUPED_PREFILL=0.
     if os.environ.get("OLALA_GROUPED_PREFILL", "1") != "0":
-        try:
-            from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import (
-                mamba3_mimo_varlen_grouped,
-            )
-
-            _mamba3_mimo_grouped = mamba3_mimo_varlen_grouped
-        except ImportError:
-            _mamba3_mimo_grouped = None
+        _mamba3_mimo_grouped = mamba3_mimo_varlen_grouped
 
 
 @triton.jit
@@ -538,86 +527,15 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             )
             return
 
-        # Continuation chunks resume a cached state. With an Input_States-
-        # capable mamba3_mimo (mamba_ssm mimo_input_state), one packed varlen
-        # call still covers the whole batch: zero-start sequences get zero
-        # init states, continuations get their pool rows.
-        if _MIMO_SUPPORTS_INPUT_STATES:
-            init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
-            self._prefill_zero_start(
-                h, out, slots, md.query_start_loc_p, pools, init_states=init,
-                qsl_cpu=md.query_start_loc_p_cpu,
-            )
-            return
+        # Continuation chunks resume a cached state: one packed varlen call
+        # still covers the whole batch, zero-start sequences get zero init
+        # states and continuations their pool rows.
+        init = self._gather_init_states(pools, slots, md.has_initial_state, h.dtype)
+        self._prefill_zero_start(
+            h, out, slots, md.query_start_loc_p, pools, init_states=init,
+            qsl_cpu=md.query_start_loc_p_cpu,
+        )
 
-        # Legacy kernel: split zero-start sequences (one packed varlen call)
-        # from continuations (serial per-token recurrence).
-        has_init = md.has_initial_state_cpu
-        qsl_cpu = md.query_start_loc_p_cpu
-        zero_idxs = [i for i in range(has_init.numel()) if not has_init[i]]
-        cont_idxs = [i for i in range(has_init.numel()) if has_init[i]]
-
-        if zero_idxs:
-            lens = [int(qsl_cpu[i + 1] - qsl_cpu[i]) for i in zero_idxs]
-            packed = torch.cat(
-                [h[int(qsl_cpu[i]) : int(qsl_cpu[i + 1])] for i in zero_idxs], dim=0
-            )
-            packed_out = torch.empty(
-                sum(lens), out.shape[1], device=out.device, dtype=out.dtype
-            )
-            packed_qsl = torch.tensor(
-                [0] + list(itertools.accumulate(lens)),
-                device=md.query_start_loc_p.device,
-                dtype=md.query_start_loc_p.dtype,
-            )
-            self._prefill_zero_start(
-                packed,
-                packed_out,
-                slots[torch.as_tensor(zero_idxs, device=slots.device)],
-                packed_qsl,
-                pools,
-            )
-            cursor = 0
-            for i, length in zip(zero_idxs, lens):
-                start = int(qsl_cpu[i])
-                out[start : start + length].copy_(packed_out[cursor : cursor + length])
-                cursor += length
-
-        if cont_idxs:
-            self._prefill_continuation(h, out, slots, qsl_cpu, cont_idxs, pools)
-
-    def _prefill_continuation(
-        self,
-        h: torch.Tensor,
-        out: torch.Tensor,
-        slots: torch.Tensor,
-        qsl_cpu: torch.Tensor,
-        req_idxs: list[int],
-        pools: tuple[torch.Tensor, ...],
-    ) -> None:
-        """Serial per-token recurrence for chunks that resume a cached state."""
-        lens = [int(qsl_cpu[i + 1] - qsl_cpu[i]) for i in req_idxs]
-        starts = [int(qsl_cpu[i]) for i in req_idxs]
-        req_slots = slots[torch.as_tensor(req_idxs, device=slots.device)]
-        for t in range(max(lens)):
-            active = [k for k, length in enumerate(lens) if t < length]
-            if not active:
-                break
-            rows = torch.as_tensor(
-                [starts[k] + t for k in active], device=h.device, dtype=torch.long
-            )
-            step_out = torch.empty(
-                len(active), out.shape[1], device=out.device, dtype=out.dtype
-            )
-            self._decode(
-                h.index_select(0, rows),
-                step_out,
-                req_slots[torch.as_tensor(active, device=req_slots.device)],
-                pools,
-            )
-            out.index_copy_(0, rows, step_out)
-
-    @staticmethod
     def _gather_init_states(
         pools: tuple[torch.Tensor, ...],
         slots: torch.Tensor,

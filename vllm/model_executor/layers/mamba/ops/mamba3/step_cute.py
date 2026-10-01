@@ -1,0 +1,1091 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Adapted from https://github.com/jgcb00/mamba/blob/9a3daf5c488d9bf01d71441988de0293fd60ef0b/mamba_ssm/ops/cute/mamba3/mamba3_step_fn.py
+# (Mamba-3, Dao AI Lab / Goombalab, Apache-2.0); forward/inference parts only.
+
+# Copyright (c) 2025, Tri Dao.
+# Modified to use tvm-ffi and fake tensors instead of dlpack.
+# Modified to optionally update state in place (state_out=None) or write to separate state_out.
+
+import math
+from typing import Optional, Type, Literal, List
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+
+import cuda.bindings.driver as cuda
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Float32, Float16, BFloat16, Boolean, const_expr
+
+from quack.compile_utils import make_fake_tensor
+from quack.cute_dsl_utils import torch2cute_dtype_map
+
+
+def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    """Transpose the first two dimensions of a tensor on smem."""
+    shape = (a.shape[1], a.shape[0], *a.shape[2:])
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+
+def select(a: cute.Tensor, mode: List[int]) -> cute.Tensor:
+    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
+
+
+
+def get_gmem_tiled_copy(dtype: Type[cutlass.Numeric], major_mode_size: int, num_threads: int, is_async: bool = True):
+    num_copy_bits = math.gcd(major_mode_size, 128 // dtype.width) * dtype.width
+    copy_elems = num_copy_bits // dtype.width
+    copy_op = cute.nvgpu.cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    gmem_threads_per_row = major_mode_size // copy_elems
+    assert num_threads % gmem_threads_per_row == 0
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // gmem_threads_per_row, gmem_threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+
+class Mamba3Step():
+    def __init__(self, tile_D: int, dstate: int, mimo: int = 1, num_warps: int = 4, remove_gate: bool = False, remove_outproj: bool = False, update_kv_state: bool = False, rotary_dim: int = 0):
+        assert num_warps >= 2
+        assert dstate % 8 == 0, "dstate must be multiple of 8" # for vectorized load /store
+        self.tile_D = tile_D
+        self.dstate = dstate
+        self.mimo = mimo
+        self.num_warps = num_warps
+        self.remove_gate = remove_gate
+        self.remove_outproj = remove_outproj
+        # When True (indexed mode only), the kernel stores the new key/value
+        # states (its B and x inputs) into mBstate/mXstate after consuming the
+        # old values — saves the caller's separate scatter kernels. Requires a
+        # single D-tile per (b, h) (tile_D >= D), otherwise the bidd=0 CTA's
+        # Bstate write would race other CTAs' reads.
+        self.update_kv_state = update_kv_state
+        # When rotary_dim > 0, the kernel applies bias + rotary to its B/C
+        # inputs itself (and updates the per-(b,h) angle state row in the
+        # pool): callers pass PRE-rotation B/C (typically head-broadcast,
+        # stride 0 on H) and never materialize the per-head rotated tensors.
+        self.rotary_dim = rotary_dim
+        self.fuse_rotary = rotary_dim > 0
+
+    def _setup_smem_layouts(self):
+        self.sState_layout = cute.make_ordered_layout((self.tile_D, self.dstate), order=(1, 0))
+        # We don't need any swizzling for Bstate, B, C
+        self.sBC_layout = cute.make_ordered_layout((self.mimo, self.dstate), order=(1, 0))
+        # We don't need any swizzling for Xproj, Zproj, Outproj
+        self.sProj_layout = cute.make_ordered_layout((self.mimo, self.tile_D), order=(1, 0))
+
+    def _setup_gmem_tiled_copy(self, ):
+        num_threads = self.num_warps * cute.arch.WARP_SIZE
+        self.gmem_tiled_copy_state = get_gmem_tiled_copy(self.dtype, self.dstate, num_threads)
+        self.gmem_tiled_copy_BC = get_gmem_tiled_copy(self.b_dtype, self.dstate, num_threads)
+        self.gmem_tiled_copy_Proj = get_gmem_tiled_copy(self.proj_dtype, self.tile_D, num_threads)
+        # Gmem tiled copy for X, Z
+        # e.g. for tile_D = 64, we only want each thread loading 2 values
+        copy_elems_x = const_expr(min(4, cute.ceil_div(self.tile_D, cute.arch.WARP_SIZE)))
+        num_copy_bits_x = copy_elems_x * self.x_dtype.width
+        copy_atom_load_x = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.x_dtype, num_bits_per_copy=num_copy_bits_x
+        )
+        gmem_threads_per_row = self.tile_D // copy_elems_x
+        assert cute.arch.WARP_SIZE >= gmem_threads_per_row   # Only 1 warp loads X, Z
+        self.gmem_tiled_copy_X = cute.make_tiled_copy_tv(
+            copy_atom_load_x, cute.make_layout(self.tile_D // copy_elems_x), cute.make_layout(copy_elems_x)
+        )
+
+
+    @cute.jit
+    def __call__(
+        # B: batch size, H: num heads, D: head dim, N: dstate, R: mimo
+        self,
+        mState: cute.Tensor,  # (B, H, D, N)
+        mBstate: cute.Tensor,  # (B, R, H, N)
+        mXstate: cute.Tensor,  # (B, H, D)
+        mA: cute.Tensor,  # (B, H)
+        mB: cute.Tensor,  # (B, R, H, N)
+        mC: cute.Tensor,  # (B, R, H, N)
+        mD: cute.Tensor,  # (H)
+        mX: cute.Tensor,  # (B, H, D)
+        mDt: cute.Tensor,  # (B, H)
+        mTrap: cute.Tensor,  # (B, H)
+        mXproj: cute.Tensor,  # (R, H, D)
+        mOutproj: Optional[cute.Tensor],  # (R, H, D), None if remove_outproj
+        mStateOut: cute.Tensor,  # (B, H, D, N) — same as mState for in-place, or separate
+        mOut: cute.Tensor,  # (B, H, D) or (B, R, H, D) if remove_outproj
+        mZ: Optional[cute.Tensor],  # (B, H, D), None if remove_gate
+        mZproj: Optional[cute.Tensor],  # (R, H, D), None if remove_gate
+        mStateBatchIdx: Optional[cute.Tensor],  # (B,) int32 — row of the state pools
+        # for each batch element; when given, mState/mStateOut/mBstate/mXstate
+        # are pools of shape (P, ...) indexed indirectly (avoids the PyTorch
+        # gather/scatter round-trip on the SSM state).
+        mStateBatchIdxOut: Optional[cute.Tensor],  # (B,) int32 — separate pool
+        # row for the state WRITES (spec-decode verify); None = write in place.
+        mBiasQ: Optional[cute.Tensor],  # (R, H, N) — fused-rotary C bias
+        mBiasK: Optional[cute.Tensor],  # (R, H, N) — fused-rotary B bias
+        mAngleProj: Optional[cute.Tensor],  # (B, H, rotary_dim/2)
+        mAnglePool: Optional[cute.Tensor],  # (P, H, rotary_dim/2) fp32, in/out
+        stream: cuda.CUstream,
+    ):
+        self.dtype = mState.element_type
+        self.b_dtype = mB.element_type
+        self.proj_dtype = mXproj.element_type
+        self.x_dtype = mX.element_type
+        assert mStateOut.element_type == self.dtype
+        assert mBstate.element_type == mB.element_type == mC.element_type
+        if const_expr(mOutproj is not None):
+            assert mXproj.element_type == mOutproj.element_type
+        if const_expr(mZ is not None):
+            assert mXproj.element_type == mZproj.element_type
+            assert mZ.element_type == self.x_dtype
+
+        self._setup_smem_layouts()
+        self._setup_gmem_tiled_copy()
+
+        # TV layout, this is the most important step as it decides which elements in B, C, State
+        # each thread will load from smem
+        num_threads = self.num_warps * cute.arch.WARP_SIZE
+        # TODO: these need to be adjusted based on dstate and tile_D
+        assert self.dstate in [32, 64, 128]
+        # TODO: This is not optimal for dstate=32 and 64, just to get sth quick to run
+        vecsize_dstate = 4 if self.dstate == 128 else 2 if self.dstate == 64 else 1
+        threads_per_dstate = self.dstate // vecsize_dstate
+        assert cute.arch.WARP_SIZE % threads_per_dstate == 0
+        num_groups = num_threads // threads_per_dstate
+        assert self.tile_D % num_groups == 0
+        lanes_per_D = self.tile_D // num_groups
+        copy_atom_state_s2r = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mState.element_type, num_bits_per_copy=vecsize_dstate * mState.element_type.width
+        )
+        tiled_copy_state_s2r = cute.make_tiled_copy_tv(
+            copy_atom_state_s2r,
+            cute.make_ordered_layout((num_groups, threads_per_dstate), order=(1, 0)),
+            cute.make_ordered_layout((lanes_per_D, vecsize_dstate), order=(1, 0)),
+        )
+        copy_atom_B_s2r = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), mB.element_type, num_bits_per_copy=vecsize_dstate * mB.element_type.width
+        )
+        tiled_copy_B_s2r = cute.make_tiled_copy_tv(
+            copy_atom_B_s2r,
+            cute.make_ordered_layout((1, threads_per_dstate), order=(1, 0)),
+            cute.make_ordered_layout((1, vecsize_dstate), order=(1, 0)),
+        )
+
+        self.buffer_align_bytes = 1024
+
+        sZproj_size = cute.cosize(self.sProj_layout) if not self.remove_gate else 0
+        sOutproj_size = cute.cosize(self.sProj_layout) if not self.remove_outproj else 0
+        # Fused-rotary: the new per-(b,h) angles are computed once into smem
+        # and consumed by both the B and C rotations; the pool row is only
+        # written at the very end of the kernel (an early in-place store races
+        # compiler-rematerialized reloads — learned the hard way).
+        sAngles_size = (self.rotary_dim // 2) if self.fuse_rotary else 0
+
+        @cute.struct
+        class SharedStorage:
+            sX: cute.struct.Align[cute.struct.MemRange[Float32, self.tile_D], 128]
+            sXgamma: cute.struct.Align[cute.struct.MemRange[Float32, self.tile_D], 128]
+            sXstate: cute.struct.Align[cute.struct.MemRange[Float32, self.tile_D], 128]
+            sState: cute.struct.Align[
+                cute.struct.MemRange[self.dtype, cute.cosize(self.sState_layout)],
+                self.buffer_align_bytes,
+            ]
+            sBstate: cute.struct.Align[
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.sBC_layout)],
+                self.buffer_align_bytes,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.sBC_layout)],
+                self.buffer_align_bytes,
+            ]
+            sC: cute.struct.Align[
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.sBC_layout)],
+                self.buffer_align_bytes,
+            ]
+            sXproj: cute.struct.Align[
+                cute.struct.MemRange[self.proj_dtype, cute.cosize(self.sProj_layout)],
+                self.buffer_align_bytes,
+            ]
+            sZproj: cute.struct.Align[
+                cute.struct.MemRange[self.proj_dtype, sZproj_size],
+                self.buffer_align_bytes,
+            ]
+            sOutproj: cute.struct.Align[
+                cute.struct.MemRange[self.proj_dtype, sOutproj_size],
+                self.buffer_align_bytes,
+            ]
+            sAngles: cute.struct.Align[
+                cute.struct.MemRange[Float32, sAngles_size], 128
+            ]
+
+        self.shared_storage = SharedStorage
+
+        self.kernel(
+            mState,
+            mBstate,
+            mXstate,
+            mA,
+            mB,
+            mC,
+            mD,
+            mX,
+            mDt,
+            mTrap,
+            mXproj,
+            mOutproj,
+            mStateOut,
+            mOut,
+            mZ,
+            mZproj,
+            mStateBatchIdx,
+            mStateBatchIdxOut,
+            mBiasQ,
+            mBiasK,
+            mAngleProj,
+            mAnglePool,
+            self.sState_layout,
+            self.sBC_layout,
+            self.sProj_layout,
+            self.gmem_tiled_copy_state,
+            self.gmem_tiled_copy_BC,
+            self.gmem_tiled_copy_Proj,
+            self.gmem_tiled_copy_X,
+            tiled_copy_state_s2r,
+            tiled_copy_B_s2r,
+            vecsize_dstate,
+        ).launch(
+            # grid: (d, h, b) — batch from mX (mState may be a larger pool
+            # when mStateBatchIdx is used)
+            grid=[cute.ceil_div(mState.shape[2], self.tile_D), mState.shape[1], mX.shape[0]],
+            block=[num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mState: cute.Tensor,  # (B, H, D, N)
+        mBstate: cute.Tensor,  # (B, R, H, N)
+        mXstate: cute.Tensor,  # (B, H, D)
+        mA: cute.Tensor,  # (B, H)
+        mB: cute.Tensor,  # (B, R, H, N)
+        mC: cute.Tensor,  # (B, R, H, N)
+        mD: cute.Tensor,  # (H)
+        mX: cute.Tensor,  # (B, H, D)
+        mDt: cute.Tensor,  # (B, H)
+        mTrap: cute.Tensor,  # (B, H)
+        mXproj: cute.Tensor,  # (R, H, D)
+        mOutproj: Optional[cute.Tensor],  # (R, H, D), None if remove_outproj
+        mStateOut: cute.Tensor,  # (B, H, D, N)
+        mOut: cute.Tensor,  # (B, H, D) or (B, R, H, D) if remove_outproj
+        mZ: Optional[cute.Tensor],  # (B, H, D), None if remove_gate
+        mZproj: Optional[cute.Tensor],  # (R, H, D), None if remove_gate
+        mStateBatchIdx: Optional[cute.Tensor],  # (B,) int32 pool-row indices
+        mStateBatchIdxOut: Optional[cute.Tensor],  # (B,) int32 write-row indices
+        mBiasQ: Optional[cute.Tensor],  # (R, H, N)
+        mBiasK: Optional[cute.Tensor],  # (R, H, N)
+        mAngleProj: Optional[cute.Tensor],  # (B, H, A)
+        mAnglePool: Optional[cute.Tensor],  # (P, H, A) fp32 in/out
+        sState_layout: cute.Layout | cute.ComposedLayout,
+        sBC_layout: cute.Layout | cute.ComposedLayout,
+        sProj_layout: cute.Layout | cute.ComposedLayout,
+        gmem_tiled_copy_state: cute.TiledCopy,
+        gmem_tiled_copy_BC: cute.TiledCopy,
+        gmem_tiled_copy_Proj: cute.TiledCopy,
+        gmem_tiled_copy_X: cute.TiledCopy,
+        tiled_copy_state_s2r: cute.TiledCopy,
+        tiled_copy_B_s2r: cute.TiledCopy,
+        vecsize_dstate: cutlass.Constexpr[int],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidd, bidh, bidb = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_idx = cute.arch.lane_idx()
+
+        limit_d = mState.shape[2]
+
+        # Pool-row index for the state tensors (indirect when mStateBatchIdx given).
+        # Batch padding (e.g. vLLM CUDA-graph capture sizes) uses negative
+        # indices (PAD_SLOT_ID = -1): clamp the row for the loads and suppress
+        # the state write so padded lanes never touch a real pool row.
+        valid_st = Boolean(True)
+        if const_expr(mStateBatchIdx is not None):
+            idx_val = Int32(mStateBatchIdx[bidb])
+            # Negative (PAD_SLOT_ID) and out-of-range rows (CUDA-graph capture
+            # dummies) are both padding: clamp loads, suppress writes.
+            pool_rows = Int32(mState.shape[0])
+            valid_st = Boolean(False)
+            if idx_val >= Int32(0):
+                if idx_val < pool_rows:
+                    valid_st = Boolean(True)
+            bidb_st = idx_val
+            if not valid_st:
+                bidb_st = Int32(0)
+        else:
+            bidb_st = bidb
+
+        # Separate write row (speculative-decode verify: position t reads the
+        # state after position t-1 and writes its own scratch slot, so k+1
+        # sequential launches leave per-position states behind). Defaults to
+        # the read row when mStateBatchIdxOut is absent (in-place update).
+        valid_out = valid_st
+        bidb_st_out = bidb_st
+        if const_expr(mStateBatchIdxOut is not None):
+            idx_out = Int32(mStateBatchIdxOut[bidb])
+            pool_rows_out = Int32(mState.shape[0])
+            valid_out = Boolean(False)
+            if idx_out >= Int32(0):
+                if idx_out < pool_rows_out:
+                    valid_out = Boolean(True)
+            bidb_st_out = idx_out
+            if not valid_out:
+                bidb_st_out = Int32(0)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Slice for CTA
+        # ///////////////////////////////////////////////////////////////////////////////
+        # (tile_D, N)
+        gState = cute.local_tile(
+            mState[bidb_st, bidh, None, None], (self.tile_D, self.dstate), (bidd, 0)
+        )
+        gStateOut = cute.local_tile(
+            mStateOut[bidb_st_out, bidh, None, None],
+            (self.tile_D, self.dstate),
+            (bidd, 0),
+        )
+        # (R, N)
+        gBstate = cute.local_tile(
+            mBstate[bidb_st, None, bidh, None], (self.mimo, self.dstate), (0, 0)
+        )
+        gB, gC = [
+            cute.local_tile(t[bidb, None, bidh, None], (self.mimo, self.dstate), (0, 0))
+            for t in (mB, mC)
+        ]
+        # (tile_D,)
+        gXstate = cute.local_tile(mXstate[bidb_st, bidh, None], (self.tile_D,), (bidd,))
+        gX = cute.local_tile(mX[bidb, bidh, None], (self.tile_D,), (bidd,))
+        if const_expr(mOutproj is not None):
+            # Output is (B, H, D), outproj reduces MIMO rank
+            gOut = cute.local_tile(mOut[bidb, bidh, None], (self.tile_D,), (bidd,))
+            gXproj = cute.local_tile(mXproj[None, bidh, None], (self.mimo, self.tile_D), (0, bidd))
+            gOutproj = cute.local_tile(mOutproj[None, bidh, None], (self.mimo, self.tile_D), (0, bidd))
+        else:
+            # Output is (B, R, H, D), no outproj reduction
+            gXproj = cute.local_tile(mXproj[None, bidh, None], (self.mimo, self.tile_D), (0, bidd))
+            gOutproj = None
+        if const_expr(mZ is not None):
+            gZ = cute.local_tile(mZ[bidb, bidh, None], (self.tile_D,), (bidd,))
+            gZproj = cute.local_tile(mZproj[None, bidh, None], (self.mimo, self.tile_D), (0, bidd))
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Generate smem tensors
+        # ///////////////////////////////////////////////////////////////////////////////
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+
+        sState = storage.sState.get_tensor(sState_layout)
+        sBstate = storage.sBstate.get_tensor(sBC_layout)
+        sB = storage.sB.get_tensor(sBC_layout)
+        sC = storage.sC.get_tensor(sBC_layout)
+        sXproj = storage.sXproj.get_tensor(sProj_layout)
+        sZproj = storage.sZproj.get_tensor(sProj_layout) if const_expr(mZ is not None) else None
+        sOutproj = storage.sOutproj.get_tensor(sProj_layout) if const_expr(mOutproj is not None) else None
+        sXstate = storage.sXstate.get_tensor(cute.make_layout(self.tile_D))
+        sX = storage.sX.get_tensor(cute.make_layout(self.tile_D))
+        sXgamma = storage.sXgamma.get_tensor(cute.make_layout(self.tile_D))
+        sAngles = (
+            storage.sAngles.get_tensor(cute.make_layout(self.rotary_dim // 2))
+            if const_expr(self.fuse_rotary) else None
+        )
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Partitioning using copy atoms
+        # ///////////////////////////////////////////////////////////////////////////////
+        gmem_thr_copy_state = gmem_tiled_copy_state.get_slice(tidx)
+        # copying states from r2g uses the same tiled copy as s2r
+        gmem_thr_copy_StateOut = tiled_copy_state_s2r.get_slice(tidx)
+        gmem_thr_copy_BC = gmem_tiled_copy_BC.get_slice(tidx)
+        gmem_thr_copy_Proj = gmem_tiled_copy_Proj.get_slice(tidx)
+        gmem_thr_copy_X = gmem_tiled_copy_X.get_slice(lane_idx)  # Only 1 warp loads X, Z
+
+        tSgS = gmem_thr_copy_state.partition_S(gState)
+        tSsS_g2s = gmem_thr_copy_state.partition_D(sState)
+        tSgSOut = gmem_thr_copy_StateOut.partition_D(gStateOut)
+        tBCgBstate = gmem_thr_copy_BC.partition_S(gBstate)
+        tBCsBstate = gmem_thr_copy_BC.partition_D(sBstate)
+        tBCgB = gmem_thr_copy_BC.partition_S(gB)
+        tBCsB = gmem_thr_copy_BC.partition_D(sB)
+        tBCgC = gmem_thr_copy_BC.partition_S(gC)
+        tBCsC = gmem_thr_copy_BC.partition_D(sC)
+        tPgXproj = gmem_thr_copy_Proj.partition_S(gXproj)
+        tPsXproj = gmem_thr_copy_Proj.partition_D(sXproj)
+        if const_expr(mZ is not None):
+            tPgZproj = gmem_thr_copy_Proj.partition_S(gZproj)
+            tPsZproj = gmem_thr_copy_Proj.partition_D(sZproj)
+        if const_expr(mOutproj is not None):
+            tPgOutproj = gmem_thr_copy_Proj.partition_S(gOutproj)
+            tPsOutproj = gmem_thr_copy_Proj.partition_D(sOutproj)
+        tXgX = gmem_thr_copy_X.partition_S(gX)
+        tXsX = gmem_thr_copy_X.partition_D(sX)
+        tXsXgamma = gmem_thr_copy_X.partition_D(sXgamma)
+        tXgXstate = gmem_thr_copy_X.partition_S(gXstate)
+        tXsXstate = gmem_thr_copy_X.partition_D(sXstate)
+
+        # Idk why this order of threads_per_dstate and num_groups are reversed
+        threads_per_dstate, num_groups = tiled_copy_state_s2r.layout_tv_tiled[0].shape
+        lanes_per_D = self.tile_D // num_groups
+
+        # For bound checking
+        cS = cute.make_identity_tensor((self.tile_D, self.dstate))
+        tScS = gmem_thr_copy_state.partition_S(cS)
+        cBC = cute.make_identity_tensor((self.mimo, self.dstate))
+        tBCcBC = gmem_thr_copy_BC.partition_S(cBC)
+        cProj = cute.make_identity_tensor((self.mimo, self.tile_D))
+        tPcProj = gmem_thr_copy_Proj.partition_S(cProj)
+
+        A_val = Float32(mA[bidb, bidh])
+        dt_val = Float32(mDt[bidb, bidh])
+        trap_val = Float32(mTrap[bidb, bidh])
+
+        # Load X and Xstate, these are small so we want to kick them off first
+        tXrX = cute.make_rmem_tensor_like(tXgX)
+        tXrXstate = cute.make_rmem_tensor_like(tXgXstate)
+        copy_elems_x = cute.size(tXgX.shape[0][0])
+        assert cute.size(tXgX.shape) == copy_elems_x  # Only 1 load instruction
+        num_loads_X = const_expr(self.tile_D // copy_elems_x)
+        need_bound_check_X = const_expr(cute.arch.WARP_SIZE > num_loads_X)
+        if warp_idx == 0:
+            if not need_bound_check_X or lane_idx < num_loads_X:
+                cute.copy(gmem_tiled_copy_X, tXgX, tXrX)
+        if warp_idx == 1:
+            if not need_bound_check_X or lane_idx < num_loads_X:
+                cute.copy(gmem_tiled_copy_X, tXgXstate, tXrXstate)
+
+        # Load Bstate, B, Xproj need bound checking
+        for m in cutlass.range(cute.size(tBCcBC.shape[1]), unroll_full=True):
+            if tBCcBC[0, m, 0][0] < self.mimo:
+                cute.copy(gmem_tiled_copy_BC, tBCgBstate[None, m, None], tBCsBstate[None, m, None])
+                cute.copy(gmem_tiled_copy_BC, tBCgB[None, m, None], tBCsB[None, m, None])
+        for m in cutlass.range(cute.size(tPcProj.shape[1]), unroll_full=True):
+            if tPcProj[0, m, 0][0] < self.mimo:
+                cute.copy(gmem_tiled_copy_Proj, tPgXproj[None, m, None], tPsXproj[None, m, None])
+        cute.arch.cp_async_commit_group()
+
+        # Load State, not doing any bound check for now
+        cute.copy(gmem_tiled_copy_state, tSgS, tSsS_g2s)
+        cute.arch.cp_async_commit_group()
+
+        alpha_val = cute.math.exp(A_val * dt_val, fastmath=True)
+        # Transform X and Xstate by multiplying with gamma and beta, then write to smem
+        if warp_idx == 0:
+            tXrX_f32 = cute.make_rmem_tensor_like(tXrX, Float32)
+            tXrX_f32.store(tXrX.load().to(Float32))
+            if not need_bound_check_X or lane_idx < num_loads_X:
+                cute.autovec_copy(tXrX_f32, tXsX)
+            gamma_val = trap_val * dt_val
+            tXrX_f32.store(tXrX_f32.load() * gamma_val)
+            if not need_bound_check_X or lane_idx < num_loads_X:
+                cute.autovec_copy(tXrX_f32, tXsXgamma)
+        if warp_idx == 1:
+            beta_val = (1.0 - trap_val) * dt_val * alpha_val
+            tXrXstate_f32 = cute.make_rmem_tensor_like(tXgXstate, Float32)
+            tXrXstate_f32.store(tXrXstate.load().to(Float32) * beta_val)
+            if not need_bound_check_X or lane_idx < num_loads_X:
+                cute.autovec_copy(tXrXstate_f32, tXsXstate)
+
+        # Load C, need bound checking
+        for m in cutlass.range(cute.size(tBCcBC.shape[1]), unroll_full=True):
+            if tBCcBC[0, m, 0][0] < self.mimo:
+                cute.copy(gmem_tiled_copy_BC, tBCgC[None, m, None], tBCsC[None, m, None])
+        cute.arch.cp_async_commit_group()
+
+        cute.arch.cp_async_wait_group(2)  # B, Bstate, Xproj are done loading
+        cute.arch.sync_threads()
+
+        if const_expr(self.fuse_rotary):
+            # ---- Fused bias + rotary on the B tile, in smem -----------------
+            # New per-(b, h) angles once into smem (consumed again for C; the
+            # pool row is only written at the END of the kernel).
+            A_half = self.rotary_dim // 2
+            gAnglePool = cute.local_tile(
+                mAnglePool[bidb_st, bidh, None], (A_half,), (0,)
+            )
+            gAngleProj = cute.local_tile(
+                mAngleProj[bidb, bidh, None], (A_half,), (0,)
+            )
+            if tidx < A_half:
+                a_proj = cute.math.tanh(
+                    Float32(gAngleProj[tidx]), fastmath=False
+                )
+                sAngles[tidx] = (
+                    Float32(gAnglePool[tidx])
+                    + a_proj * dt_val * 3.141592653589793
+                )
+            cute.arch.sync_threads()
+
+            gBiasK = cute.local_tile(
+                mBiasK[None, bidh, None], (self.mimo, self.dstate), (0, 0)
+            )
+            num_threads_k = self.num_warps * cute.arch.WARP_SIZE
+            # Rotation pairs element i with i + dstate/2 (half-half over the
+            # FULL dstate, original-RoPE style); only the first A_half pairs
+            # carry real angles, the rest are identity (angle 0 upstream).
+            pair_off = self.dstate // 2
+            total_pairs = self.mimo * A_half
+            for p0 in cutlass.range_constexpr(
+                (total_pairs + num_threads_k - 1) // num_threads_k
+            ):
+                p = p0 * num_threads_k + tidx
+                if p < total_pairs:
+                    r = p // A_half
+                    i = p % A_half
+                    lo = Float32(sB[r, i]) + Float32(gBiasK[r, i])
+                    hi = (Float32(sB[r, i + pair_off])
+                          + Float32(gBiasK[r, i + pair_off]))
+                    th = Float32(sAngles[i])
+                    c = cute.math.cos(th, fastmath=False)
+                    s = cute.math.sin(th, fastmath=False)
+                    sB[r, i] = (lo * c - hi * s).to(self.b_dtype)
+                    sB[r, i + pair_off] = (lo * s + hi * c).to(self.b_dtype)
+            # Identity dims (i in [A_half, pair_off) and partners): bias only.
+            seg = pair_off - A_half
+            total_plain = self.mimo * 2 * seg
+            for e0 in cutlass.range_constexpr(
+                (total_plain + num_threads_k - 1) // num_threads_k
+            ):
+                e = e0 * num_threads_k + tidx
+                if e < total_plain:
+                    r = e // (2 * seg)
+                    j = e % (2 * seg)
+                    n = A_half + j % seg + pair_off * (j // seg)
+                    sB[r, n] = (
+                        Float32(sB[r, n]) + Float32(gBiasK[r, n])
+                    ).to(self.b_dtype)
+            cute.arch.sync_threads()
+
+        # Load B, Bstate, Xproj from smem
+        smem_thr_copy_B = tiled_copy_B_s2r.get_slice(tidx % threads_per_dstate)
+        # ((vecsize_dstate, 1), mimo, 1) -> ((vecsize_dstate, 1), mimo)
+        tSsB = smem_thr_copy_B.partition_S(sB)[None, None, 0]
+        tSsBstate = smem_thr_copy_B.partition_S(sBstate)[None, None, 0]
+        tSrB = cute.make_rmem_tensor_like(tSsB)
+        tSrBstate = cute.make_rmem_tensor_like(tSsBstate)
+        cute.autovec_copy(tSsB, tSrB)
+        cute.autovec_copy(tSsBstate, tSrBstate)
+        tSrB_f32 = cute.make_rmem_tensor_like(tSrB, Float32)
+        tSrB_f32.store(tSrB.load().to(Float32))
+        tSrBstate_f32 = cute.make_rmem_tensor_like(tSrBstate, Float32)
+        tSrBstate_f32.store(tSrBstate.load().to(Float32))
+        # Loading x and xstate, at most 1 val per thread
+        x_val = Float32(0.0)
+        if lane_idx < lanes_per_D:
+            # TODO: should this be warp_idx or group_idx?
+            x_val = sXgamma[warp_idx * lanes_per_D + lane_idx]
+        x_state_val = Float32(0.0)
+        if lane_idx < lanes_per_D:
+            x_state_val = sXstate[warp_idx * lanes_per_D + lane_idx]
+
+        new_state = cute.make_rmem_tensor((vecsize_dstate, lanes_per_D), Float32)
+        for r in cutlass.range_constexpr(self.mimo):
+            x_proj_val = Float32(0.0)
+            if lane_idx < lanes_per_D:
+                x_proj_val = Float32(sXproj[r, warp_idx * lanes_per_D + lane_idx])
+            x_gamma_x_proj_val = x_val * x_proj_val
+            x_state_x_proj_val = x_state_val * x_proj_val
+            for d in cutlass.range(lanes_per_D, unroll_full=True):
+                xg = cute.arch.shuffle_sync(x_gamma_x_proj_val, d)
+                xb = cute.arch.shuffle_sync(x_state_x_proj_val, d)
+                for v in cutlass.range(vecsize_dstate, unroll_full=True):
+                    if const_expr(r == 0):
+                        new_state[v, d] = xg * tSrB_f32[v, r]
+                    else:
+                        new_state[v, d] += xg * tSrB_f32[v, r]
+                    new_state[v, d] += xb * tSrBstate_f32[v, r]
+
+        cute.arch.cp_async_wait_group(1)  # state is done loading
+        cute.arch.sync_threads()
+        thr_copy_state_s2r = tiled_copy_state_s2r.get_slice(tidx)
+        # ((vecsize_state, lanes_per_D), 1, 1)
+        tSsS = thr_copy_state_s2r.partition_S(sState)
+        tSrS = cute.make_rmem_tensor_like(tSsS)
+        cute.autovec_copy(tSsS, tSrS)
+
+        # ((vecsize_state, lanes_per_D), 1, 1)
+        # tSrS_f32 = cute.make_rmem_tensor_like(tSrS, Float32)
+        tSrS_f32 = cute.make_rmem_tensor(((vecsize_dstate, 1), lanes_per_D, 1), Float32)
+        assert cute.size(tSrS.shape) == cute.size(tSrS_f32.shape)
+        tSrS_f32.store(tSrS.load().to(Float32))
+        for v in cutlass.range(cute.size(tSrS_f32), unroll_full=True):
+            tSrS_f32[v] = tSrS_f32[v] * alpha_val + new_state[v]
+        tSrS.store(tSrS_f32.load().to(self.dtype))
+
+        # Load Z from gmem -> rmem, it's small, at most 1 val per thread
+        if const_expr(mZ is not None):
+            z_val = Float32(0.0)
+            if lane_idx < lanes_per_D:
+                z_val = Float32(gZ[warp_idx * lanes_per_D + lane_idx])
+        # Load Zproj and Outproj, need bound checking
+        for m in cutlass.range(cute.size(tPcProj.shape[1]), unroll_full=True):
+            if tPcProj[0, m, 0][0] < self.mimo:
+                if const_expr(mZ is not None):
+                    cute.copy(gmem_tiled_copy_Proj, tPgZproj[None, m, None], tPsZproj[None, m, None])
+                if const_expr(mOutproj is not None):
+                    cute.copy(gmem_tiled_copy_Proj, tPgOutproj[None, m, None], tPsOutproj[None, m, None])
+        cute.arch.cp_async_commit_group()
+
+        # Write state back to StateOut (may be same memory as State for in-place;
+        # a different pool row when mStateBatchIdxOut is given).
+        if const_expr(mStateBatchIdx is not None):
+            if valid_out:
+                cute.copy(tiled_copy_state_s2r, tSrS, tSgSOut)
+        else:
+            cute.copy(tiled_copy_state_s2r, tSrS, tSgSOut)
+
+        # Do state @ C
+        cute.arch.cp_async_wait_group(1)  # C is done loading
+        cute.arch.sync_threads()
+
+        if const_expr(self.fuse_rotary):
+            # ---- Fused bias + rotary on the C tile (angles from smem) ------
+            A_half_c = self.rotary_dim // 2
+            gBiasQ = cute.local_tile(
+                mBiasQ[None, bidh, None], (self.mimo, self.dstate), (0, 0)
+            )
+            num_threads_c = self.num_warps * cute.arch.WARP_SIZE
+            pair_off_c = self.dstate // 2
+            total_pairs_c = self.mimo * A_half_c
+            for p0 in cutlass.range_constexpr(
+                (total_pairs_c + num_threads_c - 1) // num_threads_c
+            ):
+                p = p0 * num_threads_c + tidx
+                if p < total_pairs_c:
+                    r = p // A_half_c
+                    i = p % A_half_c
+                    lo = Float32(sC[r, i]) + Float32(gBiasQ[r, i])
+                    hi = (Float32(sC[r, i + pair_off_c])
+                          + Float32(gBiasQ[r, i + pair_off_c]))
+                    th = Float32(sAngles[i])
+                    c = cute.math.cos(th, fastmath=False)
+                    s = cute.math.sin(th, fastmath=False)
+                    sC[r, i] = (lo * c - hi * s).to(self.b_dtype)
+                    sC[r, i + pair_off_c] = (lo * s + hi * c).to(self.b_dtype)
+            seg_c = pair_off_c - A_half_c
+            total_plain_c = self.mimo * 2 * seg_c
+            for e0 in cutlass.range_constexpr(
+                (total_plain_c + num_threads_c - 1) // num_threads_c
+            ):
+                e = e0 * num_threads_c + tidx
+                if e < total_plain_c:
+                    r = e // (2 * seg_c)
+                    j = e % (2 * seg_c)
+                    n = A_half_c + j % seg_c + pair_off_c * (j // seg_c)
+                    sC[r, n] = (
+                        Float32(sC[r, n]) + Float32(gBiasQ[r, n])
+                    ).to(self.b_dtype)
+            cute.arch.sync_threads()
+
+        # ((vecsize_dstate, 1), mimo, 1) -> ((vecsize_dstate, 1), 1, mimo)
+        tSsC = select(smem_thr_copy_B.partition_S(sC), mode=[0, 2, 1])
+        tSrC = cute.make_rmem_tensor_like(tSsC)
+        cute.autovec_copy(tSsC, tSrC)
+        tSrC_f32 = cute.make_rmem_tensor_like(tSrC, Float32)
+        tSrC_f32.store(tSrC.load().to(Float32))
+        out_expanded = cute.make_rmem_tensor((lanes_per_D, self.mimo), Float32)
+        # tSrS_f32 has shape ((vecsize_dstate, 1), lanes_per_D, 1)
+        # tSrC has shape ((vecsize_dstate, 1), mimo)
+        out_expanded.store(
+            (tSrS_f32.load() * tSrC_f32.load()).reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, None))
+        )
+        assert lanes_per_D <= threads_per_dstate
+        for d in cutlass.range(lanes_per_D, unroll_full=True):
+            for r in cutlass.range(self.mimo, unroll_full=True):
+                out_expanded[d, r] += cute.arch.shuffle_sync_bfly(out_expanded[d, r], offset=16)
+        for i in cutlass.range_constexpr(int(math.log2(lanes_per_D))):
+            step = 1 << (int(math.log2(lanes_per_D)) - 1 - i)
+            should_swap = not Boolean(lane_idx & step)
+            for j in cutlass.range_constexpr(step):
+                for r in cutlass.range(self.mimo, unroll_full=True):
+                    lower, upper = out_expanded[j, r], out_expanded[j + step, r]
+                    out_expanded[j, r] = upper if should_swap else lower
+                    out_expanded[j + step, r] = lower if should_swap else upper
+                    shfl_val = cute.arch.shuffle_sync_bfly(out_expanded[j, r], offset=step)
+                    out_expanded[j, r] = shfl_val + out_expanded[j + step, r]
+        # After this, the out values are just out_expanded[0, None]
+        out = out_expanded[0, None]  # (mimo,)
+
+        # Add D * x * x_proj to out
+        D_val = Float32(mD[bidh])
+        x_val = Float32(0.0)
+        if lane_idx < lanes_per_D:
+            x_val = sX[warp_idx * lanes_per_D + lane_idx]
+        for r in cutlass.range_constexpr(self.mimo):
+            x_proj_val = Float32(0.0)
+            if lane_idx < lanes_per_D:
+                x_proj_val = Float32(sXproj[r, warp_idx * lanes_per_D + lane_idx])
+            out[r] += D_val * x_val * x_proj_val
+
+        cute.arch.cp_async_wait_group(0)  # Zproj and Outproj are done loading
+        cute.arch.sync_threads()
+
+        # Store the new key/value states (this step's B and x) into the pools,
+        # now that every thread has consumed the old Bstate/Xstate. Single
+        # D-tile per (b, h) is guaranteed by the wrapper (tile_D >= D), so no
+        # other CTA still reads these rows. tSrB / tXrX hold the original
+        # (pre-fp32) values, so the store is bit-exact with the caller-side
+        # `k_pool[slots] = B; v_pool[slots] = x` it replaces.
+        if const_expr(self.update_kv_state and mStateBatchIdx is not None):
+            if valid_out:
+                gBstateOut = cute.local_tile(
+                    mBstate[bidb_st_out, None, bidh, None],
+                    (self.mimo, self.dstate),
+                    (0, 0),
+                )
+                gXstateOut = cute.local_tile(
+                    mXstate[bidb_st_out, bidh, None], (self.tile_D,), (bidd,)
+                )
+                tXgXstateOut = gmem_thr_copy_X.partition_S(gXstateOut)
+                tpd_b = self.dstate // vecsize_dstate
+                if tidx < tpd_b:
+                    tSgBstate_w = smem_thr_copy_B.partition_S(gBstateOut)[None, None, 0]
+                    cute.autovec_copy(tSrB, tSgBstate_w)
+                if warp_idx == 0:
+                    if not need_bound_check_X or lane_idx < num_loads_X:
+                        cute.autovec_copy(tXrX, tXgXstateOut)
+
+        # Fused rotary: write the new angle row LAST (every consumer read the
+        # smem copy; an earlier in-place pool store would race rematerialized
+        # loads). Padding lanes leave the pool untouched.
+        if const_expr(self.fuse_rotary):
+            if valid_out:
+                A_half_w = self.rotary_dim // 2
+                gAnglePool_w = cute.local_tile(
+                    mAnglePool[bidb_st_out, bidh, None], (A_half_w,), (0,)
+                )
+                if tidx < A_half_w:
+                    gAnglePool_w[tidx] = Float32(sAngles[tidx])
+
+        if const_expr(mOutproj is not None):
+            # Gate: z_r * sigmoid(z_r)
+            if const_expr(mZ is not None):
+                for r in cutlass.range_constexpr(self.mimo):
+                    z_proj_val = Float32(0.0)
+                    if lane_idx < lanes_per_D:
+                        z_proj_val = Float32(sZproj[r, warp_idx * lanes_per_D + lane_idx])
+                    z_r_half = 0.5 * (z_val * z_proj_val)
+                    z_r_silu = z_r_half * cute.math.tanh(z_r_half, fastmath=True) + z_r_half
+                    out[r] *= z_r_silu
+
+            # Final projection along mimo dim
+            out_val = Float32(0.0)
+            for r in cutlass.range_constexpr(self.mimo):
+                out_proj_val = Float32(0.0)
+                if lane_idx < lanes_per_D:
+                    out_proj_val = Float32(sOutproj[r, warp_idx * lanes_per_D + lane_idx])
+                if const_expr(r == 0):
+                    out_val = out[r] * out_proj_val
+                else:
+                    out_val += out[r] * out_proj_val
+
+            # Skip padding tokens: zero the output (selective_state_update
+            # does the same for state_batch_indices < 0).
+            if const_expr(mStateBatchIdx is not None):
+                if not valid_st:
+                    out_val = Float32(0.0)
+            # Write final output (B, H, D)
+            if lane_idx < lanes_per_D:
+                gOut[warp_idx * lanes_per_D + lane_idx] = out_val.to(mOut.element_type)
+        else:
+            # No outproj: write per-rank output (B, R, H, D)
+            for r in cutlass.range_constexpr(self.mimo):
+                gOut_r = cute.local_tile(mOut[bidb, r, bidh, None], (self.tile_D,), (bidd,))
+                out_r_val = out[r]
+                # Skip padding tokens (see above).
+                if const_expr(mStateBatchIdx is not None):
+                    if not valid_st:
+                        out_r_val = Float32(0.0)
+                if lane_idx < lanes_per_D:
+                    gOut_r[warp_idx * lanes_per_D + lane_idx] = out_r_val.to(mOut.element_type)
+
+
+def mamba3_step_fn(
+    # B: batch size, H: num heads, D: head dim, N: dstate, R: mimo
+    state: Tensor,  # (B, H, D, N) — updated in place if state_out is None
+    Bstate: Tensor,  # (B, R, H, N)
+    Xstate: Tensor,  # (B, H, D)
+    A: Tensor,  # (B, H)
+    B: Tensor,  # (B, R, H, N)
+    C: Tensor,  # (B, R, H, N)
+    D: Tensor,  # (H)
+    x: Tensor,  # (B, H, D)
+    dt: Tensor,  # (B, H)
+    trap: Tensor,  # (B, H)
+    xproj: Tensor,  # (R, H, D)
+    outproj: Optional[Tensor] = None,  # (R, H, D), None if remove_outproj
+    state_out: Optional[Tensor] = None,  # (B, H, D, N), None for in-place update
+    out: Tensor = None,  # (B, H, D) or (B, R, H, D) if remove_outproj
+    z: Optional[Tensor] = None,  # (B, H, D), None if remove_gate
+    zproj: Optional[Tensor] = None,  # (R, H, D), None if remove_gate
+    state_batch_indices: Optional[Tensor] = None,  # (B,) int32 — when given,
+    # state/Bstate/Xstate are pools of shape (P, ...) and row
+    # state_batch_indices[b] holds batch element b's state. The state is updated
+    # in place in the pool (state_out must be None). Avoids gather/scatter.
+    state_batch_indices_out: Optional[Tensor] = None,  # (B,) int32 — separate
+    # pool row for all state WRITES (ssm/k/v/angle); reads still come from
+    # state_batch_indices. Enables speculative-decode verify: k+1 sequential
+    # launches with in=slot[t-1], out=slot[t] leave per-position states.
+    # Requires state_batch_indices; negative/out-of-range rows suppress writes.
+    update_kv_state: bool = False,  # kernel also stores this step's B and x
+    # into Bstate/Xstate after consuming the old values, replacing the
+    # caller's scatter kernels. Requires state_batch_indices and tile_D >= headdim
+    # (a single D-tile per (b, h): the Bstate write would race other CTAs'
+    # reads otherwise). NOTE: mutates Bstate/Xstate.
+    rotary_dim: int = 0,  # > 0 fuses bias + rotary into the kernel: B/C are
+    # the PRE-rotation tensors (head dim may be a broadcast stride-0 view);
+    # the kernel adds rotary_bias_k/q, rotates the first rotary_dim entries
+    # of the dstate axis with angle = angle_state + tanh(angle_proj)*dt*pi,
+    # and updates rotary_angle_state row state_batch_indices[b] in place.
+    rotary_bias_q: Optional[Tensor] = None,   # (R, H, N)
+    rotary_bias_k: Optional[Tensor] = None,   # (R, H, N)
+    rotary_angle_proj: Optional[Tensor] = None,   # (B, H, rotary_dim/2)
+    rotary_angle_state: Optional[Tensor] = None,  # (P, H, rotary_dim/2) fp32
+    tile_D: int = 64,
+    num_warps: int = 2,
+) -> None:
+    has_z = z is not None
+    has_outproj = outproj is not None
+    has_state_batch_idx = state_batch_indices is not None
+    fuse_rotary = rotary_dim > 0
+    inplace = state_out is None
+    pool, nheads, hdim, dstate = state.shape
+    if update_kv_state:
+        assert has_state_batch_idx, "update_kv_state requires state_batch_indices"
+        assert tile_D >= hdim, (
+            f"update_kv_state requires a single D-tile per (b, h) "
+            f"(tile_D={tile_D} >= headdim={hdim}); with multiple D-tiles the "
+            f"bidd=0 CTA's Bstate write would race other CTAs' reads"
+        )
+    mimo = Bstate.shape[1]
+    batch = x.shape[0]
+    if has_state_batch_idx:
+        assert inplace, "state_batch_indices requires in-place update (state_out=None)"
+        assert state_batch_indices.shape == (batch,)
+        assert state_batch_indices.dtype == torch.int32
+        assert state_batch_indices.is_cuda
+    else:
+        assert pool == batch
+    has_state_batch_idx_out = state_batch_indices_out is not None
+    if has_state_batch_idx_out:
+        assert has_state_batch_idx, (
+            "state_batch_indices_out requires state_batch_indices"
+        )
+        assert state_batch_indices_out.shape == (batch,)
+        assert state_batch_indices_out.dtype == torch.int32
+        assert state_batch_indices_out.is_cuda
+    assert state.shape == (pool, nheads, hdim, dstate)
+    assert Bstate.shape == (pool, mimo, nheads, dstate)
+    assert Xstate.shape == (pool, nheads, hdim)
+    assert A.shape == (batch, nheads)
+    assert B.shape == (batch, mimo, nheads, dstate)
+    assert C.shape == (batch, mimo, nheads, dstate)
+    assert D.shape == (nheads,)
+    assert x.shape == (batch, nheads, hdim)
+    if has_z:
+        assert z.shape == (batch, nheads, hdim)
+        assert zproj is not None
+        assert zproj.shape == (mimo, nheads, hdim)
+    assert dt.shape == (batch, nheads)
+    assert trap.shape == (batch, nheads)
+    assert xproj.shape == (mimo, nheads, hdim)
+    if fuse_rotary:
+        a_half = rotary_dim // 2
+        assert has_state_batch_idx, "fused rotary requires state_batch_indices"
+        assert rotary_dim % 2 == 0 and rotary_dim <= dstate
+        assert rotary_bias_q is not None and rotary_bias_k is not None
+        assert rotary_bias_q.shape == (mimo, nheads, dstate)
+        assert rotary_bias_k.shape == (mimo, nheads, dstate)
+        assert rotary_angle_proj is not None
+        assert rotary_angle_proj.shape == (batch, nheads, a_half)
+        assert rotary_angle_state is not None
+        assert rotary_angle_state.shape == (pool, nheads, a_half)
+        assert rotary_angle_state.dtype == torch.float32
+        assert rotary_bias_q.dtype == rotary_bias_k.dtype
+    xproj = xproj.contiguous()
+    if has_outproj:
+        assert outproj.shape == (mimo, nheads, hdim)
+        assert out.shape == (batch, nheads, hdim)
+    else:
+        assert out.shape == (batch, mimo, nheads, hdim)
+
+    # Use state itself as output target when in-place
+    if inplace:
+        state_out = state
+    else:
+        assert state_out.shape == (pool, nheads, hdim, dstate)
+
+    required_tensors = [state, Bstate, Xstate, A, B, C, D, x, dt, trap, xproj, state_out, out]
+    if has_outproj:
+        required_tensors.append(outproj)
+    if has_z:
+        required_tensors.extend([z, zproj])
+    assert all(t.is_cuda for t in required_tensors)
+    assert state.dtype in [torch.float16, torch.bfloat16, torch.float32], "Unsupported input dtype"
+
+    # Map torch dtypes to cutlass dtypes
+    state_cute_dtype = torch2cute_dtype_map[state.dtype]
+    b_cute_dtype = torch2cute_dtype_map[Bstate.dtype]
+    x_cute_dtype = torch2cute_dtype_map[x.dtype]
+    proj_cute_dtype = torch2cute_dtype_map[xproj.dtype]
+    a_cute_dtype = torch2cute_dtype_map[A.dtype]
+    d_cute_dtype = torch2cute_dtype_map[D.dtype]
+    dt_cute_dtype = torch2cute_dtype_map[dt.dtype]
+    trap_cute_dtype = torch2cute_dtype_map[trap.dtype]
+
+    compile_key = (
+        tile_D,
+        num_warps,
+        dstate,
+        hdim,
+        mimo,
+        state.dtype,
+        Bstate.dtype,
+        xproj.dtype,
+        A.dtype,
+        D.dtype,
+        dt.dtype,
+        trap.dtype,
+        has_z,
+        has_outproj,
+        has_state_batch_idx,
+        has_state_batch_idx_out,
+        update_kv_state,
+        rotary_dim,
+        rotary_bias_q.dtype if fuse_rotary else None,
+    )
+    if compile_key not in mamba3_step_fn.compile_cache:
+        mamba3_step_op = Mamba3Step(tile_D, dstate, mimo, num_warps, remove_gate=not has_z, remove_outproj=not has_outproj, update_kv_state=update_kv_state, rotary_dim=rotary_dim)
+
+        # Create symbolic dimensions for batch and nheads
+        batch_sym = cute.sym_int()
+        nheads_sym = cute.sym_int()
+        # Pool row count is independent of batch when state_batch_indices is used
+        pool_sym = cute.sym_int() if has_state_batch_idx else batch_sym
+
+        # Divisibility for strides (128-bit alignment)
+        div_state = 128 // state_cute_dtype.width
+        div_b = 128 // b_cute_dtype.width
+        div_x = 128 // x_cute_dtype.width
+        div_proj = 128 // proj_cute_dtype.width
+        div_a = 128 // a_cute_dtype.width
+        div_d = 128 // d_cute_dtype.width
+        div_dt = 128 // dt_cute_dtype.width
+        div_trap = 128 // trap_cute_dtype.width
+
+        # Create fake tensors with symbolic batch/nheads dimensions
+        state_fake = make_fake_tensor(state_cute_dtype, (pool_sym, nheads_sym, hdim, dstate), div_state)
+        Bstate_fake = make_fake_tensor(b_cute_dtype, (pool_sym, mimo, nheads_sym, dstate), div_b)
+        Xstate_fake = make_fake_tensor(x_cute_dtype, (pool_sym, nheads_sym, hdim), div_x)
+        A_fake = make_fake_tensor(a_cute_dtype, (batch_sym, nheads_sym), div_a)
+        B_fake = make_fake_tensor(b_cute_dtype, (batch_sym, mimo, nheads_sym, dstate), div_b)
+        C_fake = make_fake_tensor(b_cute_dtype, (batch_sym, mimo, nheads_sym, dstate), div_b)
+        D_fake = make_fake_tensor(d_cute_dtype, (nheads_sym,), div_d)
+        x_fake = make_fake_tensor(x_cute_dtype, (batch_sym, nheads_sym, hdim), div_x)
+        dt_fake = make_fake_tensor(dt_cute_dtype, (batch_sym, nheads_sym), div_dt)
+        trap_fake = make_fake_tensor(trap_cute_dtype, (batch_sym, nheads_sym), div_trap)
+        xproj_fake = make_fake_tensor(proj_cute_dtype, (mimo, nheads_sym, hdim), div_proj)
+        outproj_fake = make_fake_tensor(proj_cute_dtype, (mimo, nheads_sym, hdim), div_proj) if has_outproj else None
+        state_out_fake = make_fake_tensor(state_cute_dtype, (pool_sym, nheads_sym, hdim, dstate), div_state)
+        if has_outproj:
+            out_fake = make_fake_tensor(x_cute_dtype, (batch_sym, nheads_sym, hdim), div_x)
+        else:
+            out_fake = make_fake_tensor(x_cute_dtype, (batch_sym, mimo, nheads_sym, hdim), div_x)
+        z_fake = make_fake_tensor(x_cute_dtype, (batch_sym, nheads_sym, hdim), div_x) if has_z else None
+        zproj_fake = make_fake_tensor(proj_cute_dtype, (mimo, nheads_sym, hdim), div_proj) if has_z else None
+        state_batch_idx_fake = (
+            make_fake_tensor(Int32, (batch_sym,)) if has_state_batch_idx else None
+        )
+        state_batch_idx_out_fake = (
+            make_fake_tensor(Int32, (batch_sym,)) if has_state_batch_idx_out else None
+        )
+        if fuse_rotary:
+            a_half = rotary_dim // 2
+            bias_cute_dtype = torch2cute_dtype_map[rotary_bias_q.dtype]
+            div_bias = 128 // bias_cute_dtype.width
+            bias_q_fake = make_fake_tensor(
+                bias_cute_dtype, (mimo, nheads_sym, dstate), div_bias)
+            bias_k_fake = make_fake_tensor(
+                bias_cute_dtype, (mimo, nheads_sym, dstate), div_bias)
+            # angle_proj is typically a head-broadcast view (stride 0 on H):
+            # only assume a contiguous last dim.
+            angle_proj_fake = make_fake_tensor(
+                torch2cute_dtype_map[rotary_angle_proj.dtype],
+                (batch_sym, nheads_sym, a_half), 1)
+            angle_pool_fake = make_fake_tensor(
+                Float32, (pool_sym, nheads_sym, a_half), 1)
+        else:
+            bias_q_fake = bias_k_fake = None
+            angle_proj_fake = angle_pool_fake = None
+
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+        mamba3_step_fn.compile_cache[compile_key] = cute.compile(
+            mamba3_step_op,
+            state_fake,
+            Bstate_fake,
+            Xstate_fake,
+            A_fake,
+            B_fake,
+            C_fake,
+            D_fake,
+            x_fake,
+            dt_fake,
+            trap_fake,
+            xproj_fake,
+            outproj_fake,
+            state_out_fake,
+            out_fake,
+            z_fake,
+            zproj_fake,
+            state_batch_idx_fake,
+            state_batch_idx_out_fake,
+            bias_q_fake,
+            bias_k_fake,
+            angle_proj_fake,
+            angle_pool_fake,
+            fake_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    # Call with real PyTorch tensors directly (no dlpack conversion needed)
+    # When inplace, state_out is state (set above)
+    mamba3_step_fn.compile_cache[compile_key](
+        state,
+        Bstate,
+        Xstate,
+        A,
+        B,
+        C,
+        D,
+        x,
+        dt,
+        trap,
+        xproj,
+        outproj,
+        state_out,
+        out,
+        z,
+        zproj,
+        state_batch_indices,
+        state_batch_indices_out,
+        rotary_bias_q,
+        rotary_bias_k,
+        rotary_angle_proj,
+        rotary_angle_state,
+    )
+
+
+mamba3_step_fn.compile_cache = {}

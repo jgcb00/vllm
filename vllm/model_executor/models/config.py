@@ -868,40 +868,21 @@ class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
                 "V layers hold different numbers of recurrent state tensors."
             )
 
-        # Chunked prefill is functionally supported when mamba3_mimo accepts
-        # Input_States (mamba_ssm's mimo_input_state merge) — continuation
-        # chunks then run in the packed varlen call, verified bit-stable. It
-        # stays OFF by default anyway: with chunking, nearly every step mixes
-        # prefill fragments with decodes, leaving the FULL-decode cudagraph
-        # regime, and measured throughput regresses badly under concurrency
-        # (128+512 c=128 on GH200: 9,198 -> 5,509 tok/s, TTFT 0.52s -> 3.6s).
-        # Opt in with OLALA_CHUNKED_PREFILL=1 for workloads that need it
-        # (very long prompts with tight interactivity SLOs); it requires the
-        # Input_States-capable kernel.
+        # Chunked prefill is functionally supported (continuation chunks run
+        # in the packed varlen call with Input_States, verified bit-stable).
+        # It stays OFF by default anyway: with chunking, nearly every step
+        # mixes prefill fragments with decodes, leaving the FULL-decode
+        # cudagraph regime, and measured throughput regresses badly under
+        # concurrency (128+512 c=128 on GH200: 9,198 -> 5,509 tok/s, TTFT
+        # 0.52s -> 3.6s). Opt in with OLALA_CHUNKED_PREFILL=1 for workloads
+        # that need it (very long prompts with tight interactivity SLOs).
         scheduler_config = vllm_config.scheduler_config
         if scheduler_config is not None and scheduler_config.enable_chunked_prefill:
-            try:
-                import inspect
-
-                from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo
-
-                has_input_states = (
-                    "Input_States" in inspect.signature(mamba3_mimo).parameters
-                )
-            except ImportError:
-                has_input_states = False
-            opt_in = os.environ.get("OLALA_CHUNKED_PREFILL") == "1"
-            if opt_in and has_input_states:
+            if os.environ.get("OLALA_CHUNKED_PREFILL") == "1":
                 logger.info(
-                    "Olala: chunked prefill enabled (OLALA_CHUNKED_PREFILL=1 "
-                    "and mamba3_mimo supports Input_States)."
+                    "Olala: chunked prefill enabled (OLALA_CHUNKED_PREFILL=1)."
                 )
             else:
-                if opt_in and not has_input_states:
-                    logger.warning(
-                        "Olala: OLALA_CHUNKED_PREFILL=1 ignored — the "
-                        "installed mamba3_mimo has no Input_States support."
-                    )
                 scheduler_config.enable_chunked_prefill = False
                 scheduler_config.long_prefill_token_threshold = 0
                 # A whole prompt must fit in one batch.
