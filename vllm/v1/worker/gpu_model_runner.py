@@ -138,8 +138,8 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.dragon_diff_tpa_attn import (
-    DragonDiffTPAMetadataBuilder,
+from vllm.v1.attention.backends.olala_diff_tpa_attn import (
+    OlalaDiffTPAMetadataBuilder,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.linear_attn import (
@@ -2474,9 +2474,9 @@ class GPUModelRunner(
             extra_attn_metadata_args = {}
             if self.speculative_config is not None and isinstance(
                 builder,
-                (Mamba3AttentionMetadataBuilder, DragonDiffTPAMetadataBuilder),
+                (Mamba3AttentionMetadataBuilder, OlalaDiffTPAMetadataBuilder),
             ):
-                # Dragon's column-slot protocol needs last-step acceptance on
+                # Olala's column-slot protocol needs last-step acceptance on
                 # EVERY step (including no-draft steps): the current state
                 # column is max(num_accepted - 1, 0), and a build without it
                 # would fall back to column 0 and read a stale state.

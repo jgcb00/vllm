@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused decode preamble / epilogue for Dragon's Differential-TPA layers.
+"""Fused decode preamble / epilogue for Olala's Differential-TPA layers.
 
 For a pure-decode batch the eager path between the input projections and the
 attention call is ~20 small kernels per layer: rank-``R`` K/V reconstruction
@@ -65,7 +65,7 @@ def _tpa_decode_qkv_kernel(
     tl.store(vpool_ptr + srow * sp_n + h * sp_h + offs, v.to(vpool_ptr.dtype.element_ty))
     tl.store(vo_ptr + n * (HKV * D) + h * D + offs, vs)
 
-    # ---- k norm (zero-centered gain), same rounding as DragonRMSNorm -------
+    # ---- k norm (zero-centered gain), same rounding as OlalaRMSNorm -------
     kw = (1.0 + tl.load(kw_ptr + offs).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
     inv = 1.0 / tl.sqrt(tl.sum(ks * ks, axis=0) / D + eps)
     kn = (ks * inv).to(tl.bfloat16).to(tl.float32)

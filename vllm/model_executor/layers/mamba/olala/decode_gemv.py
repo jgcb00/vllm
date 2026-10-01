@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-token GEMV for Dragon's decode projections.
+"""Single-token GEMV for Olala's decode projections.
 
 cuBLAS's batch-1 kernels sit on a ~4.2 us floor whatever the matrix size,
 so the many small projections of a decode step (latent MoE, in_proj_dyn,
@@ -20,7 +20,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-_DISABLED = os.environ.get("DRAGON_GEMV", "1") == "0"
+_DISABLED = os.environ.get("OLALA_GEMV", "1") == "0"
 
 
 @triton.jit
@@ -65,23 +65,23 @@ def decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _dragon_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _olala_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return decode_gemv(x, weight)
 
 
-def _dragon_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _olala_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
 
 # Opaque to torch.compile so the M == 1 dispatch is re-evaluated per cudagraph
 # capture instead of being specialized by the first (large) compile.
 direct_register_custom_op(
-    op_name="dragon_linear",
-    op_func=_dragon_linear,
+    op_name="olala_linear",
+    op_func=_olala_linear,
     mutates_args=[],
-    fake_impl=_dragon_linear_fake,
+    fake_impl=_olala_linear_fake,
 )
 
 
-def dragon_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return torch.ops.vllm.dragon_linear(x, weight)
+def olala_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.ops.vllm.olala_linear(x, weight)

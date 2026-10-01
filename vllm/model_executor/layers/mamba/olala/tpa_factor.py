@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TPA-factorized paged KV cache for Dragon's Differential-TPA layers.
+"""TPA-factorized paged KV cache for Olala's Differential-TPA layers.
 
-Dragon's ``V`` layers build K/V as rank-``R`` tensor products, mix in the
+Olala's ``V`` layers build K/V as rank-``R`` tensor products, mix in the
 previous token (token shift) and RMS-normalize K per head:
 
     k_t = norm_h(a_t k_{t-1} + (1 - a_t) A_t B_t / R)
@@ -56,7 +56,7 @@ MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits
 
 
 def factor_cache_enabled() -> bool:
-    return os.environ.get("DRAGON_TPA_FACTOR", "1") != "0"
+    return os.environ.get("OLALA_TPA_FACTOR", "1") != "0"
 
 
 # --------------------------------------------------------------------------
@@ -80,10 +80,10 @@ def _factor_block_size(vllm_config: VllmConfig) -> int:
     row_bytes = 2 * ROWP * elem
     mamba_page = cache.mamba_page_size_padded or 0
     try:
-        from vllm.model_executor.models.dragon import DragonForCausalLM
+        from vllm.model_executor.models.olala import OlalaForCausalLM
 
-        shapes = DragonForCausalLM.get_mamba_state_shape_from_config(vllm_config)
-        dtypes = DragonForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+        shapes = OlalaForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+        dtypes = OlalaForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
         raw = sum(math.prod(sh) * torch.tensor([], dtype=dt).element_size() for sh, dt in zip(shapes, dtypes))
         mamba_page = max(mamba_page, raw)
     except Exception:  # noqa: BLE001 - fall back to the cache config
@@ -95,7 +95,7 @@ def _factor_block_size(vllm_config: VllmConfig) -> int:
 
 
 @dataclass
-class DragonTPAFactorMetadata:
+class OlalaTPAFactorMetadata:
     num_decodes: int
     num_prefills: int
     num_decode_tokens: int
@@ -127,20 +127,20 @@ class DragonTPAFactorMetadata:
         return t
 
 
-class DragonTPAFactorBackend(AttentionBackend):
+class OlalaTPAFactorBackend(AttentionBackend):
     forward_includes_kv_cache_update = False
 
     @staticmethod
     def get_name() -> str:
-        return "DRAGON_TPA_FACTOR"
+        return "OLALA_TPA_FACTOR"
 
     @staticmethod
     def get_impl_cls():
         raise NotImplementedError("the factor cache layer never goes through AttentionImpl")
 
     @staticmethod
-    def get_builder_cls() -> type["DragonTPAFactorMetadataBuilder"]:
-        return DragonTPAFactorMetadataBuilder
+    def get_builder_cls() -> type["OlalaTPAFactorMetadataBuilder"]:
+        return OlalaTPAFactorMetadataBuilder
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -162,7 +162,7 @@ class DragonTPAFactorBackend(AttentionBackend):
         return head_size == ROWP
 
 
-class DragonTPAFactorMetadataBuilder(AttentionMetadataBuilder[DragonTPAFactorMetadata]):
+class OlalaTPAFactorMetadataBuilder(AttentionMetadataBuilder[OlalaTPAFactorMetadata]):
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(
@@ -176,7 +176,7 @@ class DragonTPAFactorMetadataBuilder(AttentionMetadataBuilder[DragonTPAFactorMet
         if vllm_config.speculative_config is not None:
             raise NotImplementedError(
                 "The TPA-factorized KV cache does not support speculative decoding; "
-                "set DRAGON_TPA_FACTOR=0 to use the dense paged KV cache."
+                "set OLALA_TPA_FACTOR=0 to use the dense paged KV cache."
             )
         self._init_reorder_batch_threshold(1)
 
@@ -185,7 +185,7 @@ class DragonTPAFactorMetadataBuilder(AttentionMetadataBuilder[DragonTPAFactorMet
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> DragonTPAFactorMetadata:
+    ) -> OlalaTPAFactorMetadata:
         m = common_attn_metadata
         nd, np_, ndt, npt = split_decodes_and_prefills(m, decode_threshold=1)
         qsl_p = seq_p = init_p = pos_p = None
@@ -196,7 +196,7 @@ class DragonTPAFactorMetadataBuilder(AttentionMetadataBuilder[DragonTPAFactorMet
             computed = m.compute_num_computed_tokens()[nd:].tolist()
             init_p = [c > 0 for c in computed]
             pos_p = computed
-        return DragonTPAFactorMetadata(
+        return OlalaTPAFactorMetadata(
             num_decodes=nd,
             num_prefills=np_,
             num_decode_tokens=ndt,
@@ -214,10 +214,10 @@ class DragonTPAFactorMetadataBuilder(AttentionMetadataBuilder[DragonTPAFactorMet
         )
 
 
-class DragonTPAFactorCache(nn.Module, AttentionLayerBase):
+class OlalaTPAFactorCache(nn.Module, AttentionLayerBase):
     """Owner of one V layer's factorized paged KV cache.
 
-    Never runs ``forward``: ``DragonDiffTPAAttention`` writes the factor rows
+    Never runs ``forward``: ``OlalaDiffTPAAttention`` writes the factor rows
     and runs the decode kernel on ``self.kv_cache`` directly.
     """
 
@@ -235,7 +235,7 @@ class DragonTPAFactorCache(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return DragonTPAFactorBackend
+        return OlalaTPAFactorBackend
 
     @property
     def block_size(self) -> int:
@@ -460,12 +460,12 @@ def _load_kernel():
 
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "tpa_factor_decode.cu")
     build_dir = os.environ.get(
-        "DRAGON_TPA_BUILD_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "dragon_tpa_factor"),
+        "OLALA_TPA_BUILD_DIR",
+        os.path.join(os.path.expanduser("~"), ".cache", "olala_tpa_factor"),
     )
     os.makedirs(build_dir, exist_ok=True)
     ext = load(
-        name="dragon_tpa_factor_decode",
+        name="olala_tpa_factor_decode",
         sources=[src],
         extra_cuda_cflags=["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
         extra_ldflags=["-lcuda"],

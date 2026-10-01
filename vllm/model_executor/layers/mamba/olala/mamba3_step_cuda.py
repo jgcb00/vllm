@@ -16,7 +16,7 @@ from functools import lru_cache
 
 import torch
 
-_ENV = "DRAGON_MAMBA3_STEP"
+_ENV = "OLALA_MAMBA3_STEP"
 
 
 def cuda_step_enabled() -> bool:
@@ -29,12 +29,12 @@ def _load():
 
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "mamba3_step.cu")
     build_dir = os.environ.get(
-        "DRAGON_TPA_BUILD_DIR",
-        os.path.join(os.path.expanduser("~"), ".cache", "dragon_tpa_factor"),
+        "OLALA_TPA_BUILD_DIR",
+        os.path.join(os.path.expanduser("~"), ".cache", "olala_tpa_factor"),
     )
     os.makedirs(build_dir, exist_ok=True)
     return load(
-        name="dragon_mamba3_step",
+        name="olala_mamba3_step",
         sources=[src],
         extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_90,code=sm_90"],
         build_directory=build_dir,

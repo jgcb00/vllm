@@ -1,4 +1,4 @@
-// Decode attention over a TPA-factorized KV cache (Dragon DiffTPA), sm_90.
+// Decode attention over a TPA-factorized KV cache (Olala DiffTPA), sm_90.
 // Cache row (bf16, 1216): Bk[4x128] | Bv[4x128] | Ck[12x4] | Dk[12x4] | Cv[12x4] | Dv[12x4]
 // k_t[h] = sum_r Ck[t,g(h),r] Bk_t[r] + Dk[t,g(h),r] Bk_{t-1}[r]   (same for v)
 #include <torch/extension.h>

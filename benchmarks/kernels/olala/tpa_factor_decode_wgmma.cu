@@ -1,4 +1,4 @@
-// Dragon Differential-TPA decode attention over the TPA-factorized paged KV cache (sm_90a, wgmma edition).
+// Olala Differential-TPA decode attention over the TPA-factorized paged KV cache (sm_90a, wgmma edition).
 // Per token the cache stores two 608-element bf16 rows: K plane [Bk (4x128) | Ck (12x4) | Dk (12x4)] and V plane
 // [Bv | Cv | Dv] (plain layout; TMA applies the 128B swizzle). Built JIT by tpa_factor.py.
 // One CTA per (request, KV split): a producer warp streams 13-token tiles with TMA tensor copies (128B swizzle,

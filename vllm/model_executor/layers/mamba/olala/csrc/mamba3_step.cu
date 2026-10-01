@@ -1,5 +1,5 @@
-// Dragon Mamba-3 MIMO decode step (one token per request), persistent CUDA kernel; replaces the CuteDSL step on the
-// fused decode path (vllm/model_executor/layers/mamba/dragon/mamba3.py). Built JIT by mamba3_step_cuda.py.
+// Olala Mamba-3 MIMO decode step (one token per request), persistent CUDA kernel; replaces the CuteDSL step on the
+// fused decode path (vllm/model_executor/layers/mamba/olala/mamba3.py). Built JIT by mamba3_step_cuda.py.
 // Mamba-3 MIMO decode step, persistent edition: each CTA (128 threads) walks (token, head) items with a 2-stage
 // cp.async pipeline (state 16 KB + previous B 4 KB + token rows per item) so the next item's loads overlap the
 // current item's preamble, update and store. Warp w owns state rows p in [16w, 16w+16); lane l owns columns

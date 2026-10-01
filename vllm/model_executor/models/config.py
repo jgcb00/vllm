@@ -827,15 +827,15 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
-class DragonForCausalLMConfig(VerifyAndUpdateConfig):
-    """Reconcile Dragon's HF config with vLLM's hybrid-model assumptions."""
+class OlalaForCausalLMConfig(VerifyAndUpdateConfig):
+    """Reconcile Olala's HF config with vLLM's hybrid-model assumptions."""
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
 
-        # Dragon's config reports num_key_value_heads=0, which makes the
+        # Olala's config reports num_key_value_heads=0, which makes the
         # hybrid attention/mamba page-size alignment mis-size the KV cache.
         # The real DiffTPA value is the noise-head count.
         num_signal = getattr(hf_config, "num_signal_heads_diff", 0) or (
@@ -845,7 +845,7 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
         hf_config.num_key_value_heads = num_kv_heads
         model_config.model_arch_config.total_num_kv_heads = num_kv_heads
         logger.info(
-            "Dragon: setting num_key_value_heads=%d (num_attention_heads - "
+            "Olala: setting num_key_value_heads=%d (num_attention_heads - "
             "num_signal_heads_diff)",
             num_kv_heads,
         )
@@ -859,12 +859,12 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
                 model_config.model_arch_config.num_experts = num_experts
 
         # Align mode pages mamba state for prefix caching and assumes every
-        # mamba layer exposes the same number of state tensors. Dragon's M
+        # mamba layer exposes the same number of state tensors. Olala's M
         # layers hold four and its V layers two, so reject it explicitly
         # rather than fail later inside the state-copy machinery.
         if vllm_config.cache_config.mamba_cache_mode == "align":
             raise ValueError(
-                "Dragon does not support --mamba-cache-mode align: its M and "
+                "Olala does not support --mamba-cache-mode align: its M and "
                 "V layers hold different numbers of recurrent state tensors."
             )
 
@@ -875,7 +875,7 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
         # prefill fragments with decodes, leaving the FULL-decode cudagraph
         # regime, and measured throughput regresses badly under concurrency
         # (128+512 c=128 on GH200: 9,198 -> 5,509 tok/s, TTFT 0.52s -> 3.6s).
-        # Opt in with DRAGON_CHUNKED_PREFILL=1 for workloads that need it
+        # Opt in with OLALA_CHUNKED_PREFILL=1 for workloads that need it
         # (very long prompts with tight interactivity SLOs); it requires the
         # Input_States-capable kernel.
         scheduler_config = vllm_config.scheduler_config
@@ -890,16 +890,16 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
                 )
             except ImportError:
                 has_input_states = False
-            opt_in = os.environ.get("DRAGON_CHUNKED_PREFILL") == "1"
+            opt_in = os.environ.get("OLALA_CHUNKED_PREFILL") == "1"
             if opt_in and has_input_states:
                 logger.info(
-                    "Dragon: chunked prefill enabled (DRAGON_CHUNKED_PREFILL=1 "
+                    "Olala: chunked prefill enabled (OLALA_CHUNKED_PREFILL=1 "
                     "and mamba3_mimo supports Input_States)."
                 )
             else:
                 if opt_in and not has_input_states:
                     logger.warning(
-                        "Dragon: DRAGON_CHUNKED_PREFILL=1 ignored — the "
+                        "Olala: OLALA_CHUNKED_PREFILL=1 ignored — the "
                         "installed mamba3_mimo has no Input_States support."
                     )
                 scheduler_config.enable_chunked_prefill = False
@@ -909,15 +909,16 @@ class DragonForCausalLMConfig(VerifyAndUpdateConfig):
                 if max_model_len > scheduler_config.max_num_batched_tokens:
                     scheduler_config.max_num_batched_tokens = max_model_len
                 logger.info(
-                    "Dragon: chunked prefill disabled (default; see "
-                    "DRAGON_CHUNKED_PREFILL). max_num_batched_tokens=%d",
+                    "Olala: chunked prefill disabled (default; see "
+                    "OLALA_CHUNKED_PREFILL). max_num_batched_tokens=%d",
                     scheduler_config.max_num_batched_tokens,
                 )
 
 
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
-    "DragonForCausalLM": DragonForCausalLMConfig,
+    "OlalaForCausalLM": OlalaForCausalLMConfig,
+    "DragonForCausalLM": OlalaForCausalLMConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,

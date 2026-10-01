@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dragon Mamba3 MIMO mixer.
+"""Olala Mamba3 MIMO mixer.
 
-Native port of ``DragonMamba3MimoFast`` from ``modeling_dragon.py``. The four
+Native port of ``OlalaMamba3MimoFast`` from ``modeling_olala.py``. The four
 temporal states (angle, ssm, k, v) live in vLLM's paged mamba state pool;
 per-request slots arrive as ``Mamba3AttentionMetadata.state_indices_tensor``
 from the MAMBA3 backend.
@@ -27,8 +27,8 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
-from vllm.model_executor.layers.mamba.dragon.mamba3_step_cuda import (
+from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
     cuda_step_supported,
     mamba3_step_cuda,
@@ -40,8 +40,8 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.dragon.norm import DragonNorm
-from vllm.model_executor.layers.mamba.dragon.state import (
+from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
+from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
     mamba3_state_shape,
 )
@@ -107,8 +107,8 @@ def _lazy_import_kernels() -> None:
     )
     # Group-parallel exact prefill (mamba_ssm mamba3-prefill-opt): splits long
     # sequences into virtual groups for GPU occupancy — same math, ~1.4x on
-    # long prompts. Disable with DRAGON_GROUPED_PREFILL=0.
-    if os.environ.get("DRAGON_GROUPED_PREFILL", "1") != "0":
+    # long prompts. Disable with OLALA_GROUPED_PREFILL=0.
+    if os.environ.get("OLALA_GROUPED_PREFILL", "1") != "0":
         try:
             from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import (
                 mamba3_mimo_varlen_grouped,
@@ -229,7 +229,7 @@ def _decode_preamble_bc_kernel(
         tl.store(bn_cn_ptr + q * S + offs_s, (vals * inv * wsel).to(bn_cn_ptr.dtype.element_ty))
 
 
-class DragonMamba3Mixer(PluggableLayer, MambaBase):
+class OlalaMamba3Mixer(PluggableLayer, MambaBase):
     """Mamba3 MIMO mixer over vLLM's paged recurrent state.
 
     State layout per request slot:
@@ -311,8 +311,8 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
 
         eps = config.norm_epsilon
         zc = getattr(config, "zero_centered_gamma", False)
-        self.B_norm = DragonNorm(self.d_state, eps=eps, zero_centered=zc)
-        self.C_norm = DragonNorm(self.d_state, eps=eps, zero_centered=zc)
+        self.B_norm = OlalaNorm(self.d_state, eps=eps, zero_centered=zc)
+        self.C_norm = OlalaNorm(self.d_state, eps=eps, zero_centered=zc)
 
         self.in_proj_mimo_x = nn.Parameter(
             torch.full(
@@ -356,7 +356,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             # Per-rank local-shard norm: each rank normalizes only its own
             # d_inner slice, which differs numerically from a global RMSNorm
             # but matches how the mixer output is split.
-            self.output_norm = DragonNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
+            self.output_norm = OlalaNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
             set_weight_attrs(self.output_norm.norm.weight, head_shard)
 
         # Register in the static forward-context table so the runner can find
@@ -382,12 +382,12 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         _, ssm_dtype, k_dtype, v_dtype = dtypes
         if ssm_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
-                f"Dragon mamba3 supports an fp32 or bf16 SSM state, got "
+                f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
                 f"{ssm_dtype}. Set --mamba-ssm-cache-dtype to float32 or auto."
             )
         if k_dtype != torch.bfloat16 or v_dtype != torch.bfloat16:
             raise ValueError(
-                f"Dragon mamba3 requires a bf16 key/value state, got "
+                f"Olala mamba3 requires a bf16 key/value state, got "
                 f"{k_dtype}/{v_dtype}. Leave --mamba-cache-dtype at auto with "
                 f"a bf16 model."
             )
@@ -408,7 +408,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         """``(num_tokens, hidden_size)`` in, ``(num_tokens, d_inner/tp)`` out.
 
         The state-dependent work runs outside the compiled graph as the
-        ``vllm::dragon_mamba3`` custom op, mirroring ``mamba_mixer2``.
+        ``vllm::olala_mamba3`` custom op, mirroring ``mamba_mixer2``.
         """
         out = torch.empty(
             hidden_states.shape[0],
@@ -416,7 +416,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        torch.ops.vllm.dragon_mamba3(
+        torch.ops.vllm.olala_mamba3(
             hidden_states, out, _encode_layer_name(self.prefix)
         )
         return out
@@ -529,7 +529,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         pools: tuple[torch.Tensor, ...],
     ) -> None:
         # Fast path: every prompt starts from zero state, so one packed varlen
-        # launch covers the batch. DragonForCausalLMConfig disables chunked
+        # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
         if not md.has_initial_any:
             self._prefill_zero_start(
@@ -753,7 +753,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         would silently blend old and new weights.
 
         The snapshots are refreshed IN PLACE rather than dropped. FULL-mode
-        CUDA graphs capture ``_decode`` (inside the ``dragon_mamba3`` op) and
+        CUDA graphs capture ``_decode`` (inside the ``olala_mamba3`` op) and
         bake the snapshot tensors' raw device addresses into every captured
         decode graph. Dropping the cache frees those tensors; once the
         caching allocator reuses or releases the segment, every subsequent
@@ -825,7 +825,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         self,
         u: torch.Tensor,  # (ndt, D) — all decode tokens, ragged per request
         out: torch.Tensor,  # (ndt, d_inner_local)
-        spec,  # DragonSpecMetadata
+        spec,  # OlalaSpecMetadata
         pools: tuple[torch.Tensor, ...],
     ) -> None:
         """Speculative verify: chain the dual-slot step kernel over positions.
@@ -842,7 +842,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
         R, S = self.mimo_dim, self.d_state
         if not (self.ngroups == 1 and _is_pow2(D) and _is_pow2(S)):
             raise NotImplementedError(
-                "Dragon spec decode requires ngroups == 1 and power-of-two "
+                "Olala spec decode requires ngroups == 1 and power-of-two "
                 "headdim/d_state (the fused preamble shapes)."
             )
         assert self.headdim <= _STEP_TILE_D
@@ -1043,7 +1043,7 @@ class DragonMamba3Mixer(PluggableLayer, MambaBase):
             out.copy_(y.to(out.dtype))
 
 
-def dragon_mamba3(
+def olala_mamba3(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
@@ -1053,7 +1053,7 @@ def dragon_mamba3(
     self._forward_impl(hidden_states, output)
 
 
-def dragon_mamba3_fake(
+def olala_mamba3_fake(
     hidden_states: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
@@ -1062,8 +1062,8 @@ def dragon_mamba3_fake(
 
 
 direct_register_custom_op(
-    op_name="dragon_mamba3",
-    op_func=dragon_mamba3,
+    op_name="olala_mamba3",
+    op_func=olala_mamba3,
     mutates_args=["output"],
-    fake_impl=dragon_mamba3_fake,
+    fake_impl=olala_mamba3_fake,
 )

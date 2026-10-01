@@ -1,4 +1,4 @@
-// Dragon Differential-TPA decode attention over the TPA-factorized paged KV cache (sm_90).
+// Olala Differential-TPA decode attention over the TPA-factorized paged KV cache (sm_90).
 //
 // Per token the cache stores two 608-element bf16 rows: K plane [Bk (4x128) | Ck (12x4) | Dk (12x4)] and
 // V plane [Bv | Cv | Dv]; k_t = sum_r Ck[t,h,r] Bk[t,r] + sum_r Dk[t,h,r] Bk[t-1,r] (token shift folded in), same for v.
@@ -7,7 +7,7 @@
 // mbarrier pipeline; 3 consumer warps (48 query heads) keep Q and the output accumulator in mma.sync fragments,
 // reconstruct the scores through the rank-4 factors, run the online softmax (with optional tanh soft-cap) in
 // registers and accumulate W = p*C + p'*D against Bv. Partial (o, m, l) per split are merged by a Triton combine.
-// Built JIT by vllm/model_executor/layers/mamba/dragon/tpa_factor.py.
+// Built JIT by vllm/model_executor/layers/mamba/olala/tpa_factor.py.
 // TPA-factorized decode attention, v2: register-resident mma.sync pipeline (sm_90).
 // Cache row (bf16, 1216): Bk[4x128] | Bv[4x128] | Ck[12x4] | Dk[12x4] | Cv[12x4] | Dv[12x4]
 #include <torch/extension.h>

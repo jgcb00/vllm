@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Parity tests for the fused Dragon decode kernels.
+"""Parity tests for the fused Olala decode kernels.
 
 Each fused kernel replaces a chain of small eager ops on the decode hot path;
 these tests pin them to the eager reference (and, for the geodesic update, to
@@ -12,13 +12,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.mamba.dragon.mamba3 import (
+from vllm.model_executor.layers.mamba.olala.mamba3 import (
     _bc_norm_kernel,
     _decode_preamble_kernel,
 )
-from vllm.model_executor.models.dragon import DragonGeodesicNorm
+from vllm.model_executor.models.olala import OlalaGeodesicNorm
 
-H, D, R, S = 48, 64, 4, 128  # Dragon 7A1B dims
+H, D, R, S = 48, 64, 4, 128  # Olala 7A1B dims
 A_FLOOR = 1e-4
 EPS = 1e-5
 
@@ -33,7 +33,7 @@ requires_cuda = pytest.mark.skipif(
 def test_geodesic_fp32_parity(layer_idx: int, n: int):
     """In fp32 the fused kernel must match the eager reference closely."""
     torch.manual_seed(0)
-    m = DragonGeodesicNorm(layer_idx).to("cuda", torch.float32)
+    m = OlalaGeodesicNorm(layer_idx).to("cuda", torch.float32)
     with torch.no_grad():
         m.scale.copy_(torch.tensor(1.37))
         m.bias.copy_(torch.tensor(-0.21))
@@ -51,8 +51,8 @@ def test_geodesic_bf16_closer_to_fp32_truth():
     """bf16 diffs against eager are eager's own rounding: the fused kernel
     keeps fp32 intermediates and must be at least as close to fp32 truth."""
     torch.manual_seed(0)
-    m16 = DragonGeodesicNorm(0).to("cuda", torch.bfloat16)
-    m32 = DragonGeodesicNorm(0).to("cuda", torch.float32)
+    m16 = OlalaGeodesicNorm(0).to("cuda", torch.bfloat16)
+    m32 = OlalaGeodesicNorm(0).to("cuda", torch.float32)
     x = torch.randn(4096, 1536, device="cuda") * 3.0
     g = torch.randn(4096, 1536, device="cuda")
     xb, gb = x.bfloat16(), g.bfloat16()
@@ -129,7 +129,7 @@ def test_token_shift_decode_parity(n: int, npad: int):
     block), so they must leave every live request's row untouched — writing to
     row 0 itself is harmless because no request is ever allocated that block.
     """
-    from vllm.model_executor.layers.mamba.dragon.diff_tpa import (
+    from vllm.model_executor.layers.mamba.olala.diff_tpa import (
         _token_shift_decode_kernel,
     )
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID

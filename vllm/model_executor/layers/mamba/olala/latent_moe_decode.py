@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Small-batch path for Dragon's latent MoE (decode).
+"""Small-batch path for Olala's latent MoE (decode).
 
 The generic modular MoE path (permute / align / two grouped gemms / unpermute
 / reduce) launches ~15 kernels per layer, which at batch <= 16 costs more in
@@ -10,7 +10,7 @@ gather-GEMV kernels (up + relu^2, down + routed weight + scale) and keeps
 the shared expert and latent projections as plain GEMVs. Same math as the
 runner: ``shared(x) + fc2(scale * sum_k w_k * E_k(fc1(x)))``.
 
-The whole MoE call is the custom op ``vllm::dragon_latent_moe`` (layer
+The whole MoE call is the custom op ``vllm::olala_latent_moe`` (layer
 looked up by name, like the mixers): the small/generic dispatch on the
 token count then happens inside the op, where torch.compile cannot
 specialize it away.
@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.dragon.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -183,7 +183,7 @@ def moe_cat_shared(routed: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     return cat
 
 
-def dragon_moe_small(
+def olala_moe_small(
     hidden: torch.Tensor,         # [M, hidden] bf16
     router_logits: torch.Tensor,  # [M, E] fp32
     e_score_bias: torch.Tensor,   # [E] fp32
@@ -195,7 +195,7 @@ def dragon_moe_small(
     routed_scale: float,
 ) -> torch.Tensor:
     """Small-batch latent MoE. ``w_in``/``w_out`` are the cached concatenations
-    of the latent and shared-expert projections (see DragonLatentMoE)."""
+    of the latent and shared-expert projections (see OlalaLatentMoE)."""
     M = hidden.shape[0]
     dev = hidden.device
     E, N1, D1 = w13.shape
@@ -224,7 +224,7 @@ def dragon_moe_small(
     return decode_gemv(cat, w_out)                    # shared + fc2(routed), one GEMV
 
 
-def _dragon_latent_moe(
+def _olala_latent_moe(
     hidden: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: LayerNameType,
@@ -233,7 +233,7 @@ def _dragon_latent_moe(
     return layer.forward_dispatch(hidden, router_logits)
 
 
-def _dragon_latent_moe_fake(
+def _olala_latent_moe_fake(
     hidden: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: LayerNameType,
@@ -242,8 +242,8 @@ def _dragon_latent_moe_fake(
 
 
 direct_register_custom_op(
-    op_name="dragon_latent_moe",
-    op_func=_dragon_latent_moe,
+    op_name="olala_latent_moe",
+    op_func=_olala_latent_moe,
     mutates_args=[],
-    fake_impl=_dragon_latent_moe_fake,
+    fake_impl=_olala_latent_moe_fake,
 )

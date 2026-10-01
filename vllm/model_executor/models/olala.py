@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only Dragon model for vLLM.
+"""Inference-only Olala model for vLLM.
 
-Dragon is a hybrid stack:
+Olala is a hybrid stack:
 
-* ``M`` layers — :class:`DragonMamba3Mixer`, an SSM with four temporal states
+* ``M`` layers — :class:`OlalaMamba3Mixer`, an SSM with four temporal states
   paged through the MAMBA3 backend.
-* ``V`` layers — :class:`DragonDiffTPAAttention`, differential tensor-product
+* ``V`` layers — :class:`OlalaDiffTPAAttention`, differential tensor-product
   softmax attention over paged KV, plus a one-token shift buffer paged through
-  the DRAGON_DIFF_TPA side-channel backend.
-* MLP — :class:`DragonLatentMoE` (latent projection, 256 routed experts, one
-  shared expert) or the dense :class:`DragonMLP`.
+  the OLALA_DIFF_TPA side-channel backend.
+* MLP — :class:`OlalaLatentMoE` (latent projection, 256 routed experts, one
+  shared expert) or the dense :class:`OlalaMLP`.
 
 Known fidelity gaps, flagged rather than papered over:
 
-* vLLM's ``get_rope`` stands in for Dragon's custom p-rope.
+* vLLM's ``get_rope`` stands in for Olala's custom p-rope.
 * ``scalable_softmax`` pre-scales q but the softmax scale itself is vLLM's;
   sliding-window bounds only the log position, not the attention mask.
 * ``token_conv1d_attn``, ``xsa``, ``use_value_embedding`` and ``cosnet`` are
@@ -40,11 +40,11 @@ from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
-from vllm.model_executor.layers.mamba.dragon.decode_gemv import dragon_linear
-from vllm.model_executor.layers.mamba.dragon.latent_moe_decode import (
+from vllm.model_executor.layers.mamba.olala.decode_gemv import olala_linear
+from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
     FUSED_PROJ_MAX_TOKENS,
     SMALL_BATCH_MAX_TOKENS,
-    dragon_moe_small,
+    olala_moe_small,
     moe_cat_shared,
 )
 from vllm.utils.torch_utils import _encode_layer_name
@@ -59,12 +59,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.dragon import (
-    DragonDiffTPAAttention,
-    DragonMamba3Mixer,
-    DragonNorm,
+from vllm.model_executor.layers.mamba.olala import (
+    OlalaDiffTPAAttention,
+    OlalaMamba3Mixer,
+    OlalaNorm,
 )
-from vllm.model_executor.layers.mamba.dragon.state import (
+from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
     mamba3_state_shape,
 )
@@ -94,8 +94,8 @@ logger = init_logger(__name__)
 SUPPORTED_LAYER_TYPES = frozenset({"M", "V"})
 
 
-class DragonMLP(nn.Module):
-    """Dense ReLU² MLP (``fc_1 -> relu² -> fc_2``) in Dragon's naming."""
+class OlalaMLP(nn.Module):
+    """Dense ReLU² MLP (``fc_1 -> relu² -> fc_2``) in Olala's naming."""
 
     def __init__(self, config, prefix: str = "", quant_config=None):
         super().__init__()
@@ -122,11 +122,11 @@ class DragonMLP(nn.Module):
         return x
 
 
-class DragonSharedMLP(nn.Module):
+class OlalaSharedMLP(nn.Module):
     """Shared-expert ReLU² MLP.
 
     The checkpoint's ``fc_1``/``fc_2`` are remapped to ``up_proj``/``down_proj``
-    in :meth:`DragonForCausalLM.load_weights`. Results are not reduced here —
+    in :meth:`OlalaForCausalLM.load_weights`. Results are not reduced here —
     the MoE runner all-reduces the combined shared plus routed output once.
     """
 
@@ -162,7 +162,7 @@ class DragonSharedMLP(nn.Module):
         return x
 
 
-class DragonLatentMoE(nn.Module):
+class OlalaLatentMoE(nn.Module):
     """Latent MoE with sigmoid routing and non-gated ReLU² experts.
 
     Tokens are projected down to ``moe_routed_input_dim`` before the experts
@@ -177,7 +177,7 @@ class DragonLatentMoE(nn.Module):
         self.num_experts = config.moe_num_routed_experts
         self.top_k = config.moe_num_active_experts
         if not self.latent_size:
-            raise ValueError("DragonLatentMoE requires moe_routed_input_dim")
+            raise ValueError("OlalaLatentMoE requires moe_routed_input_dim")
 
         self.gate = GateLinear(
             self.hidden_size,
@@ -192,7 +192,7 @@ class DragonLatentMoE(nn.Module):
 
         shared_intermediate = config.moe_shared_intermediate_size
         if shared_intermediate and shared_intermediate > 0:
-            self.shared_experts = DragonSharedMLP(
+            self.shared_experts = OlalaSharedMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=shared_intermediate,
                 prefix=f"{prefix}.shared_experts",
@@ -263,11 +263,11 @@ class DragonLatentMoE(nn.Module):
 
         # Small-batch (decode) path: two gather-GEMV kernels instead of the
         # generic permute/grouped-gemm pipeline. Single GPU, unquantized only;
-        # DRAGON_MOE_SMALL=0 disables it.
+        # OLALA_MOE_SMALL=0 disables it.
         self.routed_scaling_factor = float(config.moe_routed_scaling_factor)
         self._small_w: tuple[torch.Tensor, torch.Tensor] | None = None
         self._small_path = (
-            self._fused_proj and os.environ.get("DRAGON_MOE_SMALL", "1") != "0"
+            self._fused_proj and os.environ.get("OLALA_MOE_SMALL", "1") != "0"
         )
 
         # Registered like the mixers so the MoE call is one opaque custom op
@@ -282,7 +282,7 @@ class DragonLatentMoE(nn.Module):
         orig_shape = x.shape
         hidden_states = x.reshape(-1, orig_shape[-1])
         router_logits, _ = self.gate(hidden_states)
-        out = torch.ops.vllm.dragon_latent_moe(
+        out = torch.ops.vllm.olala_latent_moe(
             hidden_states, router_logits, _encode_layer_name(self.registry_name)
         )
         return out.reshape(orig_shape)
@@ -293,7 +293,7 @@ class DragonLatentMoE(nn.Module):
         if self._small_path and hidden_states.shape[0] <= SMALL_BATCH_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
             re = self.experts.routed_experts
-            return dragon_moe_small(
+            return olala_moe_small(
                 hidden_states,
                 router_logits,
                 self.gate.e_score_correction_bias,
@@ -405,8 +405,8 @@ def _geodesic_norm_kernel(
     )
 
 
-class DragonGeodesicNorm(nn.Module):
-    """Geodesic residual update, port of Dragon's ``DragonGeodesicNorm``.
+class OlalaGeodesicNorm(nn.Module):
+    """Geodesic residual update, port of Olala's ``OlalaGeodesicNorm``.
 
     Blends the residual ``x`` with the mixer/MLP output ``g`` along the tangent
     direction on the hypersphere, bounded by a per-layer rotation angle
@@ -469,7 +469,7 @@ class DragonGeodesicNorm(nn.Module):
         return x * torch.cos(theta) + unit_tangent * safe_R * torch.sin(theta)
 
 
-class DragonMonoBlock(nn.Module):
+class OlalaMonoBlock(nn.Module):
     """Single-mixer block: pre-norm, mixer, optional gate, projection, MLP."""
 
     def __init__(
@@ -484,7 +484,7 @@ class DragonMonoBlock(nn.Module):
         super().__init__()
         if layer_type not in SUPPORTED_LAYER_TYPES:
             raise NotImplementedError(
-                f"DragonMonoBlock: layer type {layer_type!r} is not ported "
+                f"OlalaMonoBlock: layer type {layer_type!r} is not ported "
                 f"(supported: {sorted(SUPPORTED_LAYER_TYPES)})."
             )
         self.config = config
@@ -497,14 +497,14 @@ class DragonMonoBlock(nn.Module):
         quant_config = vllm_config.quant_config
 
         if layer_type == "M":
-            self.mixer: nn.Module = DragonMamba3Mixer(
+            self.mixer: nn.Module = OlalaMamba3Mixer(
                 config, vllm_config=vllm_config, prefix=f"{prefix}.mixer"
             )
             head_dim = self.mixer.headdim
             num_heads = self.mixer.nheads
             self.use_gate = False  # mamba3 gates internally via z
         else:
-            self.mixer = DragonDiffTPAAttention(
+            self.mixer = OlalaDiffTPAAttention(
                 config, vllm_config=vllm_config, prefix=f"{prefix}.mixer"
             )
             head_dim = self.mixer.head_dim
@@ -517,7 +517,7 @@ class DragonMonoBlock(nn.Module):
         tp = get_tensor_model_parallel_world_size()
         if self.num_heads % tp:
             raise ValueError(
-                f"DragonMonoBlock: num_heads={self.num_heads} is not divisible "
+                f"OlalaMonoBlock: num_heads={self.num_heads} is not divisible "
                 f"by tensor_parallel_size={tp}"
             )
         self.num_heads_local = self.num_heads // tp
@@ -526,7 +526,7 @@ class DragonMonoBlock(nn.Module):
         if self.use_gate:
             if config.gate_type != "elementwise":
                 raise NotImplementedError(
-                    f"DragonMonoBlock: gate_type={config.gate_type!r} is not "
+                    f"OlalaMonoBlock: gate_type={config.gate_type!r} is not "
                     f"ported (only 'elementwise' is supported)."
                 )
             # Column-parallel on the output head axis, so each rank produces
@@ -548,7 +548,7 @@ class DragonMonoBlock(nn.Module):
                 self.gate_act = torch.sigmoid
             else:
                 raise NotImplementedError(
-                    f"DragonMonoBlock: gate_act={config.gate_act!r} is not ported."
+                    f"OlalaMonoBlock: gate_act={config.gate_act!r} is not ported."
                 )
 
         # Row-parallel: each rank matmuls its own head slice, then all-reduces.
@@ -568,16 +568,16 @@ class DragonMonoBlock(nn.Module):
         if self.is_geodesic:
             self.input_norm: nn.Module = nn.Identity()
             self.postmixer_norm: nn.Module = nn.Identity()
-            self.geodesic_mixer = DragonGeodesicNorm(layer_idx)
-            self.geodesic_mlp = DragonGeodesicNorm(layer_idx)
+            self.geodesic_mixer = OlalaGeodesicNorm(layer_idx)
+            self.geodesic_mlp = OlalaGeodesicNorm(layer_idx)
         else:
-            self.input_norm = DragonNorm(config.hidden_size, eps=eps, zero_centered=zc)
-            self.postmixer_norm = DragonNorm(
+            self.input_norm = OlalaNorm(config.hidden_size, eps=eps, zero_centered=zc)
+            self.postmixer_norm = OlalaNorm(
                 config.hidden_size, eps=eps, zero_centered=zc
             )
 
         if config.moe:
-            self.mlp: nn.Module = DragonLatentMoE(
+            self.mlp: nn.Module = OlalaLatentMoE(
                 config,
                 vllm_config.parallel_config,
                 prefix=f"{prefix}.mlp",
@@ -586,10 +586,10 @@ class DragonMonoBlock(nn.Module):
         else:
             if config.mlp_type != "simple":
                 raise NotImplementedError(
-                    f"DragonMonoBlock: mlp_type={config.mlp_type!r} is not "
+                    f"OlalaMonoBlock: mlp_type={config.mlp_type!r} is not "
                     f"ported (only 'simple' is supported)."
                 )
-            self.mlp = DragonMLP(
+            self.mlp = OlalaMLP(
                 config, prefix=f"{prefix}.mlp", quant_config=quant_config
             )
 
@@ -640,7 +640,7 @@ class DragonMonoBlock(nn.Module):
                 n, self.mixer_out_dim_local
             )
         if self._plain_mixer_proj:
-            y_mix = dragon_linear(y_mix, self.mixer_proj.weight)
+            y_mix = olala_linear(y_mix, self.mixer_proj.weight)
         else:
             y_mix, _ = self.mixer_proj(y_mix)
 
@@ -667,8 +667,8 @@ class DragonMonoBlock(nn.Module):
         "inputs_embeds": 0,
     }
 )
-class DragonModel(nn.Module):
-    """Token embedding, a stack of :class:`DragonMonoBlock`, optional norm."""
+class OlalaModel(nn.Module):
+    """Token embedding, a stack of :class:`OlalaMonoBlock`, optional norm."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -678,9 +678,9 @@ class DragonModel(nn.Module):
 
         self.embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
-        def build_block(prefix: str) -> DragonMonoBlock:
+        def build_block(prefix: str) -> OlalaMonoBlock:
             idx = int(prefix.rsplit(".", 1)[1])
-            return DragonMonoBlock(
+            return OlalaMonoBlock(
                 config=config,
                 vllm_config=vllm_config,
                 layer_idx=idx,
@@ -698,7 +698,7 @@ class DragonModel(nn.Module):
         if not get_pp_group().is_last_rank:
             self.final_norm: nn.Module = PPMissingLayer()
         elif config.final_norm:
-            self.final_norm = DragonNorm(
+            self.final_norm = OlalaNorm(
                 config.hidden_size,
                 eps=config.norm_epsilon,
                 zero_centered=getattr(config, "zero_centered_gamma", False),
@@ -754,7 +754,7 @@ def moe_layer_indices(config) -> list[int]:
     return list(range(len(config.layers_config))) if config.moe else []
 
 
-class DragonForCausalLM(
+class OlalaForCausalLM(
     nn.Module,
     HasInnerState,
     IsHybrid,
@@ -762,9 +762,9 @@ class DragonForCausalLM(
     SupportsPP,
     SupportsLoRA,
 ):
-    """Dragon causal LM with paged KV and paged recurrent state."""
+    """Olala causal LM with paged KV and paged recurrent state."""
 
-    # Dragon's projection names (c_q / W_A_k / in_proj / in_proj_dyn / ...) do
+    # Olala's projection names (c_q / W_A_k / in_proj / in_proj_dyn / ...) do
     # not map onto vLLM's qkv_proj / gate_up_proj packing, so the default
     # packed-module handling is disabled.
     packed_modules_mapping: dict[str, list[str]] = {}
@@ -806,11 +806,11 @@ class DragonForCausalLM(
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:
         # Align mode assumes every mamba layer exposes the same number of
-        # state tensors; Dragon's M layers have four and its V layers two, so
+        # state tensors; Olala's M layers have four and its V layers two, so
         # the single flat tuple this protocol expects cannot describe it.
-        # DragonForCausalLMConfig rejects --mamba-cache-mode align up front.
+        # OlalaForCausalLMConfig rejects --mamba-cache-mode align up front.
         raise NotImplementedError(
-            "Dragon does not support mamba prefix caching (align mode): its M "
+            "Olala does not support mamba prefix caching (align mode): its M "
             "and V layers hold different numbers of state tensors."
         )
 
@@ -821,7 +821,7 @@ class DragonForCausalLM(
             # The CosNet sidecar branch is not ported; accepting the flag
             # would silently drop a trained residual path.
             raise NotImplementedError(
-                "DragonForCausalLM: config.cosnet is not supported."
+                "OlalaForCausalLM: config.cosnet is not supported."
             )
         self.config = config
         self.vllm_config = vllm_config
@@ -829,7 +829,7 @@ class DragonForCausalLM(
         self.scheduler_config = vllm_config.scheduler_config
         self.quant_config = vllm_config.quant_config
 
-        self.model = DragonModel(
+        self.model = OlalaModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
@@ -853,10 +853,10 @@ class DragonForCausalLM(
         """Populate the MixtureOfExperts bookkeeping surface."""
         self.expert_weights: list[object] = []
         self.moe_layers: list[nn.Module] = []
-        example: DragonLatentMoE | None = None
+        example: OlalaLatentMoE | None = None
         for layer in self.model.layers:
-            if isinstance(layer, DragonMonoBlock) and isinstance(
-                layer.mlp, DragonLatentMoE
+            if isinstance(layer, OlalaMonoBlock) and isinstance(
+                layer.mlp, OlalaLatentMoE
             ):
                 example = layer.mlp
                 self.moe_layers.append(layer.mlp.experts)
@@ -882,7 +882,7 @@ class DragonForCausalLM(
         self.num_redundant_experts = routed.global_num_experts - example.num_experts
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        # Dragon's experts are non-gated (w1/w2 only) and arrive packed in a
+        # Olala's experts are non-gated (w1/w2 only) and arrive packed in a
         # single tensor per layer, which load_weights scatters directly. No
         # checkpoint-name mapping applies, and an empty list keeps the generic
         # machinery from picking up RoutedExperts' gated default.
@@ -931,8 +931,8 @@ class DragonForCausalLM(
         """
         params: dict[int, tuple[nn.Parameter, nn.Parameter]] = {}
         for idx, layer in enumerate(self.model.layers):
-            if isinstance(layer, DragonMonoBlock) and isinstance(
-                layer.mlp, DragonLatentMoE
+            if isinstance(layer, OlalaMonoBlock) and isinstance(
+                layer.mlp, OlalaLatentMoE
             ):
                 routed = layer.mlp.experts.routed_experts
                 params[idx] = (routed.w13_weight, routed.w2_weight)
@@ -942,7 +942,7 @@ class DragonForCausalLM(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        """Load a Dragon safetensors checkpoint.
+        """Load a Olala safetensors checkpoint.
 
         Remaps, for MoE layers:
             ``mlp.moe_gate.weight``            -> ``mlp.gate.weight``
@@ -982,7 +982,7 @@ class DragonForCausalLM(
                         "experts.experts.weight",
                         "experts.output_experts.weight",
                     ):
-                        # Dragon packs every expert into one tensor; scatter it
+                        # Olala packs every expert into one tensor; scatter it
                         # into the fused w13/w2 parameters expert by expert.
                         # NOTE: RoutedExperts.weight_loader dispatches on the
                         # weight NAME ("weight" substring), so the target must
@@ -1005,7 +1005,7 @@ class DragonForCausalLM(
                             )
                             if not success:
                                 raise RuntimeError(
-                                    f"Dragon load_weights: expert weight "
+                                    f"Olala load_weights: expert weight "
                                     f"{target} (expert {expert_id}) was not "
                                     f"accepted by the loader."
                                 )
@@ -1043,12 +1043,12 @@ class DragonForCausalLM(
                 loaded.add(name)
             else:
                 logger.warning_once(
-                    "Dragon load_weights: parameter %s not found, skipping.", name
+                    "Olala load_weights: parameter %s not found, skipping.", name
                 )
 
         self._maybe_prenormalize_embeddings()
         for module in self.modules():
-            if isinstance(module, (DragonMamba3Mixer, DragonDiffTPAAttention, DragonLatentMoE)):
+            if isinstance(module, (OlalaMamba3Mixer, OlalaDiffTPAAttention, OlalaLatentMoE)):
                 module.refresh_weight_caches()
         return loaded
 

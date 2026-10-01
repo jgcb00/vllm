@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared speculative-decode metadata for the Dragon mamba backends.
+"""Shared speculative-decode metadata for the Olala mamba backends.
 
 Slot protocol (same as upstream mamba2): every decode request carries
 ``1 + num_spec`` block-table columns. The state after the last committed
@@ -24,7 +24,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
 @dataclass
-class DragonSpecMetadata:
+class OlalaSpecMetadata:
     # (num_decodes, 1 + num_spec) int32 — per-request state slot columns
     # (slice of the persistent block table).
     state_cols: torch.Tensor
@@ -45,14 +45,14 @@ class DragonSpecMetadata:
         return self.state_cols.gather(1, col.unsqueeze(1)).squeeze(1)
 
 
-def build_dragon_spec_metadata(
+def build_olala_spec_metadata(
     m: CommonAttentionMetadata,
     block_table_tensor: torch.Tensor,
     num_decodes: int,
     num_spec: int,
     num_accepted_tokens: torch.Tensor | None,
     num_accepted_buf: torch.Tensor,
-) -> DragonSpecMetadata | None:
+) -> OlalaSpecMetadata | None:
     """Build spec metadata, staging acceptance into the persistent buffer.
 
     ``num_accepted_tokens`` is None during cudagraph capture (the runner only
@@ -70,7 +70,7 @@ def build_dragon_spec_metadata(
         num_accepted_buf[:num_decodes].fill_(1)
     qsl_cpu = m.query_start_loc_cpu[: num_decodes + 1]
     qlens = tuple(int(v) for v in torch.diff(qsl_cpu).tolist())
-    return DragonSpecMetadata(
+    return OlalaSpecMetadata(
         state_cols=block_table_tensor[:num_decodes, : 1 + num_spec],
         num_accepted_tokens=num_accepted_buf[:num_decodes],
         query_start_loc_d=m.query_start_loc[: num_decodes + 1],

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Backend for Dragon's Mamba3 MIMO mixer.
+"""Backend for Olala's Mamba3 MIMO mixer.
 
 The mixer keeps four per-request temporal states (angle, ssm, k, v) and has no
 causal conv1d, so this metadata is much smaller than GDN's: a prefill/decode
 split, the state slot lookup, and the prefill query layout.
 
-Speculative decoding uses the column-slot protocol (see dragon_spec_utils):
+Speculative decoding uses the column-slot protocol (see olala_spec_utils):
 verify batches chain the dual-slot step kernel, one launch per draft
 position, leaving per-position states that next step's acceptance selects.
 """
@@ -22,9 +22,9 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.dragon_spec_utils import (
-    DragonSpecMetadata,
-    build_dragon_spec_metadata,
+from vllm.v1.attention.backends.olala_spec_utils import (
+    OlalaSpecMetadata,
+    build_olala_spec_metadata,
 )
 from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
@@ -76,7 +76,7 @@ class Mamba3AttentionMetadata:
 
     # Speculative decoding (verify batches, column-slot protocol). None when
     # spec decode is off or the batch has no decode rows.
-    spec: DragonSpecMetadata | None = None
+    spec: OlalaSpecMetadata | None = None
 
 
 class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMetadata]):
@@ -151,7 +151,7 @@ class Mamba3AttentionMetadataBuilder(AttentionMetadataBuilder[Mamba3AttentionMet
             )
 
         spec = (
-            build_dragon_spec_metadata(
+            build_olala_spec_metadata(
                 m,
                 block_table_tensor,
                 num_decodes,

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-request recurrent state layouts for the Dragon mixers.
+"""Per-request recurrent state layouts for the Olala mixers.
 
-Dragon carries two kinds of paged recurrent state, both allocated through
+Olala carries two kinds of paged recurrent state, both allocated through
 ``MambaSpec`` so vLLM's state manager owns the per-request slots:
 
 * Mamba3 MIMO (``M`` layers) — four temporal tensors.
