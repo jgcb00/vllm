@@ -7,6 +7,10 @@ a 2-stage cp.async pipeline; the rank-4 state update and the C-contraction
 run on tensor cores. Numerically equivalent to the CuteDSL step within bf16
 rounding (the state is bf16-rounded before the C dot). GH200, B=64: 40 us
 per layer vs 57 us (CuteDSL); B=16: 11.4 vs 15.1; B=1: 3.8 vs 6.1.
+
+An fp32 SSM pool runs the update and the C dot as fp32 FMAs on the unrounded
+state (matches the CuteDSL fp32 step to ~1e-4 relative). GH200, B=64: 73 us
+vs 80 us (CuteDSL); B=16: 17.5 vs 18.5.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ def _load():
 def cuda_step_supported(ssm_pool, k_pool, v_pool, angle_pool, B, C, angle, num_heads, head_dim, d_state, rank, num_angles) -> bool:
     return (
         num_heads == 48 and head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
-        and ssm_pool.dtype == torch.bfloat16 and k_pool.dtype == torch.bfloat16 and v_pool.dtype == torch.bfloat16
+        and ssm_pool.dtype in (torch.float32, torch.bfloat16) and k_pool.dtype == torch.bfloat16 and v_pool.dtype == torch.bfloat16
         and angle_pool.dtype == torch.float32
         and B.dim() == 3 and B.stride(1) == d_state and B.stride(2) == 1 and (B.stride(0) * 2) % 16 == 0
         and C.stride() == B.stride() and angle.stride(1) == 1 and (angle.stride(0) * 2) % 16 == 0

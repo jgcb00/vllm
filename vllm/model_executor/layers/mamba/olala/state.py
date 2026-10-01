@@ -34,14 +34,14 @@ def mamba3_state_dtype(
     The angle state accumulates rotary phase across the whole sequence, so it
     is always fp32 — a bf16 accumulator visibly drifts over long contexts.
     The SSM state honors ``--mamba-ssm-cache-dtype``; under the default
-    ``auto`` it follows the model dtype (bf16), which measured
-    quality-neutral on gsm8k/humaneval/RULER and worth +16% decode throughput
-    at high concurrency versus fp32 storage. Kernel compute stays fp32 either
-    way. Pass ``--mamba-ssm-cache-dtype float32`` to store fp32 instead.
+    ``auto`` it is stored fp32: re-rounding the state to bf16 after every
+    decode step compounds over long generations and was linked to
+    repetition loops (bf16 storage is ~16% faster at high concurrency; opt in
+    with ``--mamba-ssm-cache-dtype bfloat16``).
     """
     state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
     if mamba_ssm_cache_dtype == "auto":
-        ssm_dtype = state_dtype
+        ssm_dtype = torch.float32
     else:
         ssm_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
     return (torch.float32, ssm_dtype, state_dtype, state_dtype)

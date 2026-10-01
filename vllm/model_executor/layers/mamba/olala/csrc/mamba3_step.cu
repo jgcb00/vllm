@@ -5,6 +5,8 @@
 // current item's preamble, update and store. Warp w owns state rows p in [16w, 16w+16); lane l owns columns
 // s in [4l, 4l+4) -> per row a warp touches 256 contiguous bytes of the smem tile (conflict-free), the rank-4
 // coefficients B'[r][s], Bstate[r][s], C'[r][s] of the thread's 4 columns live in registers.
+// Two state storage dtypes (template F32): bf16 runs the update and the C dot on tensor cores; fp32 keeps the state
+// unrounded end to end (fp32 FMA update and C dot over the same fragment layout) — memory-bound either way.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
@@ -16,10 +18,14 @@ constexpr int H = 48, D = 64, S = 128, R = 4, NA = 32;
 #define STEP_NST 2
 #endif
 constexpr int THREADS = 128, NST = STEP_NST;
+// fp32 stages are 2x larger: one stage and 4 CTAs/SM beats a 2-stage pipeline at 2 CTAs/SM (2.85 vs 2.53 TB/s, B=64)
+template <bool F32> constexpr int kStages = F32 ? 1 : NST;
 constexpr int LDS = S + 8;   // padded smem row (bf16 elems) -> conflict-free ldmatrix on the state tile
 constexpr int LDB = S + 8;   // padded rows for the B / C operand tiles
-struct __align__(128) Stage {
-  __nv_bfloat16 state[D * LDS];   // 17 KB (padded rows)
+constexpr int LDSF = S + 8;  // padded fp32 state row (8-word skew: conflict-free float2 fragment access)
+template <bool F32> struct StateTile { __nv_bfloat16 state[D * LDS]; };   // 17 KB (padded rows)
+template <> struct StateTile<true> { float state[D * LDSF]; };            // 33 KB
+template <bool F32> struct __align__(128) Stage : StateTile<F32> {
   __nv_bfloat16 bst[R * S];       // 1 KB previous B (k_pool)
   __nv_bfloat16 bm[R * S];        // 1 KB token B rows
   __nv_bfloat16 cm[R * S];        // 1 KB token C rows
@@ -27,8 +33,8 @@ struct __align__(128) Stage {
   __nv_bfloat16 angp[NA];
   float angst[NA];
 };
-struct __align__(128) Smem {
-  Stage st[NST];
+template <bool F32> struct __align__(128) Smem {
+  Stage<F32> st[kStages<F32>];
   float bias_k[R * S], bias_q[R * S];                  // per-head (fixed per CTA)
   float xproj[R * D], zproj[R * D], outproj[R * D];
   float sCos[NA], sSin[NA];
@@ -52,7 +58,7 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) { __nv_bfloat1
 __device__ __forceinline__ float rbf(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
 struct Args {
-  __nv_bfloat16* ssm; __nv_bfloat16* kp; __nv_bfloat16* vp; float* angle; int P;
+  void* ssm; __nv_bfloat16* kp; __nv_bfloat16* vp; float* angle; int P;
   const float* A; const __nv_bfloat16* Bm; const __nv_bfloat16* Cm; const float* Dp; const __nv_bfloat16* x; const float* dt; const float* trap;
   const float* xproj; const float* zproj; const float* outproj; const __nv_bfloat16* z; const float* bias_q; const float* bias_k;
   const __nv_bfloat16* angp; const int* slots; __nv_bfloat16* y; int B;
@@ -60,13 +66,18 @@ struct Args {
   long long ssm_sst, kp_sst, vp_sst, ang_sst;   // slot (dim 0) strides of the pools in elements (pages may be padded)
 };
 
-__device__ __forceinline__ void issue_item(const Args& a, Stage& st, int item, int t) {
+template <bool F32> __device__ __forceinline__ void issue_item(const Args& a, Stage<F32>& st, int item, int t) {
   const int h = item % H, b = item / H;
   const int slot = a.slots[b]; const int srow = (slot >= 0 && slot < a.P) ? slot : 0;
-  // state 16 KB = 1024 x 16B -> 8 per thread
-  const __nv_bfloat16* src = a.ssm + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
+  if constexpr (F32) {   // state 32 KB = 2048 x 16B -> 16 per thread
+    const float* src = reinterpret_cast<const float*>(a.ssm) + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) { const int c = t + i * THREADS, row = c >> 4, ch = c & 15; cp16(st.state + row * LDS + ch * 8, src + c * 8); }
+    for (int i = 0; i < 16; ++i) { const int c = t + i * THREADS, row = c >> 5, ch = c & 31; cp16(st.state + row * LDSF + ch * 4, src + c * 4); }
+  } else {               // state 16 KB = 1024 x 16B -> 8 per thread
+    const __nv_bfloat16* src = reinterpret_cast<const __nv_bfloat16*>(a.ssm) + (size_t)srow * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { const int c = t + i * THREADS, row = c >> 4, ch = c & 15; cp16(st.state + row * LDS + ch * 8, src + c * 8); }
+  }
   // previous B (k_pool), token B / C rows: 64 x 16B chunks each
   if (t < 64) {
     const int r = t >> 4, c = t & 15;
@@ -86,9 +97,9 @@ __device__ __forceinline__ void issue_item(const Args& a, Stage& st, int item, i
 #ifndef STEP_MINB
 #define STEP_MINB 4
 #endif
-__global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(const Args a) {
+template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(const Args a) {
   extern __shared__ __align__(128) char smem_raw[];
-  Smem& S_ = *reinterpret_cast<Smem*>(smem_raw);
+  Smem<F32>& S_ = *reinterpret_cast<Smem<F32>*>(smem_raw);
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int h = blockIdx.x % H, nb_stride = gridDim.x / H;   // grid is a multiple of H
   const int nitems = a.B * H;
@@ -104,17 +115,17 @@ __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(co
   const int nk = (a.B - b0 + nb_stride - 1) / nb_stride;                 // items of this CTA
   if (b0 >= a.B) return;
 #pragma unroll
-  for (int s = 0; s < NST - 1; ++s) { if (s < nk) issue_item(a, S_.st[s], item_of(s), t); cp_commit(); }
+  for (int s = 0; s < kStages<F32> - 1; ++s) { if (s < nk) issue_item(a, S_.st[s], item_of(s), t); cp_commit(); }
   for (int k = 0; k < nk; ++k) {
     const int item = item_of(k);
-    { const int pf = k + NST - 1; if (pf < nk) issue_item(a, S_.st[pf % NST], item_of(pf), t); cp_commit(); }
+    { const int pf = k + kStages<F32> - 1; if (pf < nk) issue_item(a, S_.st[pf % kStages<F32>], item_of(pf), t); cp_commit(); }
     const int b = item / H;
     const int slot = a.slots[b]; const bool valid = slot >= 0 && slot < a.P;
     const float dt = a.dt[b * H + h], A = a.A[b * H + h], trap = a.trap[b * H + h];
     const float Dh = a.Dp[h];
-    cp_wait<NST - 1>();
+    cp_wait<kStages<F32> - 1>();
     __syncthreads();
-    Stage& st = S_.st[k % NST];
+    Stage<F32>& st = S_.st[k % kStages<F32>];
     const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
     // ---- preamble: angles, bias + rotary on B/C (bf16-rounded)
     if (t < NA) { const float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; S_.sTheta[t] = th; __sincosf(fmodf(th, 6.283185307179586f), &S_.sSin[t], &S_.sCos[t]); }
@@ -137,8 +148,64 @@ __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(co
     }
 #endif
     __syncthreads();
-    // ---- state update on tensor cores: h_new = alpha h + A Bk, A[p][k] = (k<4: gamma x[p] xproj[k][p]; 4<=k<8: beta xstate[p] xproj[k-4][p])
     const int qd = lane & 3, p0 = warp * 16 + (lane >> 2);
+    if constexpr (F32) {
+      // ---- h_new = alpha h + sum_k A[p][k] Bk[k][s] in fp32 over the mma fragment layout (rows p0, p0+8;
+      // columns jt*8 + 2qd + {0,1}); then o[p][r] = sum_s h_new[p][s] C'[r][s], reduced over the 4 qd lanes
+      float av[2][8];
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int p = p0 + e * 8;
+        const float xp = bf2f(st.x[p]), xs = bf2f(st.xst[p]);
+#pragma unroll
+        for (int r = 0; r < R; ++r) { const float xpj = S_.xproj[r * D + p]; av[e][r] = gamma * xp * xpj; av[e][4 + r] = beta * xs * xpj; }
+      }
+      float o[2][R];
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int r = 0; r < R; ++r) o[e][r] = 0.f;
+#pragma unroll
+      for (int jt = 0; jt < 16; ++jt) {
+        const int n = jt * 8 + 2 * qd;
+        float2 bk[8], cr[R];
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) bk[kk] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sBk[kk][n]));
+#pragma unroll
+        for (int r = 0; r < R; ++r) cr[r] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&S_.sCb[r][n]));
+#pragma unroll
+        for (int e = 0; e < 2; ++e) {
+          float2* hp = reinterpret_cast<float2*>(st.state + (p0 + e * 8) * LDSF + n);
+          float2 hv = *hp;
+          hv.x *= alpha; hv.y *= alpha;
+#pragma unroll
+          for (int kk = 0; kk < 8; ++kk) { hv.x = fmaf(av[e][kk], bk[kk].x, hv.x); hv.y = fmaf(av[e][kk], bk[kk].y, hv.y); }
+          *hp = hv;
+#pragma unroll
+          for (int r = 0; r < R; ++r) o[e][r] = fmaf(hv.x, cr[r].x, fmaf(hv.y, cr[r].y, o[e][r]));
+        }
+      }
+#pragma unroll
+      for (int e = 0; e < 2; ++e)
+#pragma unroll
+        for (int r = 0; r < R; ++r) { o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 1); o[e][r] += __shfl_xor_sync(0xffffffffu, o[e][r], 2); }
+      float ys[2];
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {   // lane qd takes r = qd
+        const int p = p0 + e * 8;
+        const float xp = bf2f(st.x[p]), zp = bf2f(st.z[p]);
+        float orr = o[e][0];
+#pragma unroll
+        for (int r = 1; r < R; ++r) orr = (qd == r) ? o[e][r] : orr;
+        orr += Dh * xp * S_.xproj[qd * D + p];
+        const float zv = zp * S_.zproj[qd * D + p];
+        orr *= __fdividef(zv, 1.f + __expf(-zv));
+        ys[e] = orr * S_.outproj[qd * D + p];
+        ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 1); ys[e] += __shfl_xor_sync(0xffffffffu, ys[e], 2);
+      }
+      if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
+    } else {
+    // ---- state update on tensor cores: h_new = alpha h + A Bk, A[p][k] = (k<4: gamma x[p] xproj[k][p]; 4<=k<8: beta xstate[p] xproj[k-4][p])
     uint32_t af[4];
     {
       float av[2][2];
@@ -215,16 +282,23 @@ __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3_step_cuda_kernel(co
       ys[0] += __shfl_xor_sync(0xffffffffu, ys[0], 1); ys[1] += __shfl_xor_sync(0xffffffffu, ys[1], 1);
       if (qd == 0) { a.y[((size_t)b * H + h) * D + p0] = __float2bfloat16(valid ? ys[0] : 0.f); a.y[((size_t)b * H + h) * D + p0 + 8] = __float2bfloat16(valid ? ys[1] : 0.f); }
     }
+    }
     __syncthreads();   // state tile fully updated in smem
 #ifdef V_NOSTORE
     if (false) {
 #else
     if (valid) {
 #endif
-      // coalesced store of the state tile: 1024 x 16B
-      __nv_bfloat16* dst = a.ssm + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+      // coalesced store of the state tile (16B per thread per chunk)
+      if constexpr (F32) {
+        float* dst = reinterpret_cast<float*>(a.ssm) + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) { const int c = t + i * THREADS, row = c >> 4, ch = c & 15; *reinterpret_cast<uint4*>(dst + c * 8) = *reinterpret_cast<const uint4*>(st.state + row * LDS + ch * 8); }
+        for (int i = 0; i < 16; ++i) { const int c = t + i * THREADS, row = c >> 5, ch = c & 31; *reinterpret_cast<uint4*>(dst + c * 4) = *reinterpret_cast<const uint4*>(st.state + row * LDSF + ch * 4); }
+      } else {
+        __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(a.ssm) + (size_t)slot * a.ssm_sst + ((size_t)h * D) * S;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { const int c = t + i * THREADS, row = c >> 4, ch = c & 15; *reinterpret_cast<uint4*>(dst + c * 8) = *reinterpret_cast<const uint4*>(st.state + row * LDS + ch * 8); }
+      }
       if (t < 64) { const int r = t >> 4, c = t & 15; *reinterpret_cast<uint4*>(a.kp + (size_t)slot * a.kp_sst + ((size_t)r * H + h) * S + c * 8) = *reinterpret_cast<const uint4*>(&S_.sBk[r][c * 8]); }
       if (t < D) a.vp[(size_t)slot * a.vp_sst + (size_t)h * D + t] = st.x[t];
       if (t < NA) a.angle[(size_t)slot * a.ang_sst + (size_t)h * NA + t] = S_.sTheta[t];
@@ -239,7 +313,7 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
                     torch::Tensor xproj, torch::Tensor zproj, torch::Tensor outproj, torch::Tensor z, torch::Tensor bias_q, torch::Tensor bias_k,
                     torch::Tensor angle_proj, torch::Tensor slots, torch::Tensor y, int64_t ctas_per_sm) {
   Args a;
-  a.ssm = reinterpret_cast<__nv_bfloat16*>(ssm_pool.data_ptr()); a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
+  a.ssm = ssm_pool.data_ptr(); a.kp = reinterpret_cast<__nv_bfloat16*>(k_pool.data_ptr()); a.vp = reinterpret_cast<__nv_bfloat16*>(v_pool.data_ptr());
   a.angle = angle_pool.data_ptr<float>(); a.P = ssm_pool.size(0); a.A = A.data_ptr<float>(); a.Bm = reinterpret_cast<const __nv_bfloat16*>(Bm.data_ptr()); a.Cm = reinterpret_cast<const __nv_bfloat16*>(Cm.data_ptr());
   a.Dp = Dp.data_ptr<float>(); a.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()); a.dt = dt.data_ptr<float>(); a.trap = trap.data_ptr<float>();
   a.xproj = xproj.data_ptr<float>(); a.zproj = zproj.data_ptr<float>(); a.outproj = outproj.data_ptr<float>(); a.z = reinterpret_cast<const __nv_bfloat16*>(z.data_ptr());
@@ -250,14 +324,21 @@ void mamba3_step_cuda(torch::Tensor ssm_pool, torch::Tensor k_pool, torch::Tenso
   TORCH_CHECK(ssm_pool.stride(1) == D * S && ssm_pool.stride(2) == S && ssm_pool.stride(3) == 1, "ssm_pool inner dims must be contiguous");
   TORCH_CHECK(k_pool.stride(1) == H * S && k_pool.stride(2) == S && k_pool.stride(3) == 1, "k_pool inner dims must be contiguous");
   TORCH_CHECK(v_pool.stride(1) == D && v_pool.stride(2) == 1 && angle_pool.stride(1) == NA && angle_pool.stride(2) == 1);
-  TORCH_CHECK((a.ssm_sst * 2) % 16 == 0 && (a.kp_sst * 2) % 16 == 0 && (a.vp_sst * 2) % 16 == 0 && (a.ang_sst * 4) % 16 == 0, "pool slot strides must be 16B aligned");
+  const bool f32 = ssm_pool.dtype() == torch::kFloat32;
+  TORCH_CHECK((a.ssm_sst * ssm_pool.element_size()) % 16 == 0 && (a.kp_sst * 2) % 16 == 0 && (a.vp_sst * 2) % 16 == 0 && (a.ang_sst * 4) % 16 == 0, "pool slot strides must be 16B aligned");
   TORCH_CHECK(Bm.stride(1) == S && Bm.stride(2) == 1 && Cm.stride(0) == Bm.stride(0) && Cm.stride(1) == S && angle_proj.stride(1) == 1);
   TORCH_CHECK((Bm.stride(0) * 2) % 16 == 0 && (angle_proj.stride(0) * 2) % 16 == 0, "B/C batch stride and angle_proj row stride must be 16B aligned");
-  TORCH_CHECK(ssm_pool.dtype() == torch::kBFloat16 && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
-  static bool attr = false; const int smem = sizeof(Smem);
-  if (!attr) { cudaFuncSetAttribute(mamba3_step_cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-  int nsm = 132; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
-  const int items = a.B * H; int grid = std::min<int>(items, nsm * (int)ctas_per_sm); grid = std::max(H, (grid / H) * H);
-  mamba3_step_cuda_kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
+  TORCH_CHECK((f32 || ssm_pool.dtype() == torch::kBFloat16) && k_pool.dtype() == torch::kBFloat16 && v_pool.dtype() == torch::kBFloat16 && angle_pool.dtype() == torch::kFloat32);
+  auto launch = [&](auto kernel, int smem) {
+    static bool attr[2] = {false, false};
+    if (!attr[f32]) { cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr[f32] = true; }
+    int nsm = 132; cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    int fit = 1; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fit, kernel, THREADS, smem);
+    const int cps = std::max(1, std::min<int>((int)ctas_per_sm, fit));
+    const int items = a.B * H; int grid = std::min<int>(items, nsm * cps); grid = std::max(H, (grid / H) * H);
+    kernel<<<grid, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(a);
+  };
+  if (f32) launch(mamba3_step_cuda_kernel<true>, (int)sizeof(Smem<true>));
+  else launch(mamba3_step_cuda_kernel<false>, (int)sizeof(Smem<false>));
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("step", &mamba3_step_cuda); }
