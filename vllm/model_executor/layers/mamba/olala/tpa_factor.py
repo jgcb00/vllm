@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -52,11 +53,27 @@ ROWP = RANK * HEAD_DIM + 2 * HKV * RANK  # 608 bf16 per plane row
 OFF_C, OFF_D = RANK * HEAD_DIM, RANK * HEAD_DIM + HKV * RANK
 TILE = 13  # tokens per kernel tile; block sizes are multiples of it
 TARGET_CTAS = 400  # ~3 CTAs per SM on GH200
+logger = init_logger(__name__)
+
 MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
 
 
+@lru_cache(maxsize=1)
 def factor_cache_enabled() -> bool:
-    return os.environ.get("OLALA_TPA_FACTOR", "1") != "0"
+    """OLALA_TPA_FACTOR (default on), on Hopper only (the decode kernel is
+    sm_90a wgmma), and only if its JIT build succeeds: otherwise the dense
+    paged KV path is used, with a warning instead of a failed first forward."""
+    if os.environ.get("OLALA_TPA_FACTOR", "1") == "0":
+        return False
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        logger.warning("Olala: TPA factor cache needs an sm_90 GPU; using dense KV.")
+        return False
+    try:
+        _load_kernel()
+    except Exception as e:  # noqa: BLE001 - any build/load failure falls back
+        logger.warning("Olala: TPA factor kernel unavailable (%s); using dense KV.", e)
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------

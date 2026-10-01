@@ -20,11 +20,28 @@ from functools import lru_cache
 
 import torch
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 _ENV = "OLALA_MAMBA3_STEP"
 
 
+@lru_cache(maxsize=1)
 def cuda_step_enabled() -> bool:
-    return os.environ.get(_ENV, "cuda") == "cuda"
+    """OLALA_MAMBA3_STEP=cuda (default), on Hopper only (sm_90 SASS), and only
+    if the JIT build succeeds; otherwise the CuteDSL step is used."""
+    if os.environ.get(_ENV, "cuda") != "cuda":
+        return False
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        logger.warning("Olala: CUDA Mamba-3 step needs an sm_90 GPU; using CuteDSL.")
+        return False
+    try:
+        _load()
+    except Exception as e:  # noqa: BLE001 - any build/load failure falls back
+        logger.warning("Olala: CUDA Mamba-3 step unavailable (%s); using CuteDSL.", e)
+        return False
+    return True
 
 
 @lru_cache(maxsize=1)
