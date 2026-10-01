@@ -35,6 +35,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -64,14 +65,27 @@ def factor_cache_enabled() -> bool:
     sm_90a wgmma), and only if its JIT build succeeds: otherwise the dense
     paged KV path is used, with a warning instead of a failed first forward."""
     if os.environ.get("OLALA_TPA_FACTOR", "1") == "0":
+        logger.info("Olala: TPA factor cache disabled by OLALA_TPA_FACTOR=0.")
         return False
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-        logger.warning("Olala: TPA factor cache needs an sm_90 GPU; using dense KV.")
+        cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        warn_slow_path(
+            "TPA factor KV cache disabled",
+            f"the decode kernel is sm_90a (Hopper) only; this GPU is sm_{cap}",
+            "dense paged KV cache: 2.5x more KV memory and slower long-context decode (up to -40% throughput at 24k)",
+            "run on H100/H200/GH200 (nothing to fix elsewhere; output is correct)",
+        )
         return False
     try:
         _load_kernel()
     except Exception as e:  # noqa: BLE001 - any build/load failure falls back
-        logger.warning("Olala: TPA factor kernel unavailable (%s); using dense KV.", e)
+        warn_slow_path(
+            "TPA factor KV cache disabled",
+            f"JIT build of tpa_factor_decode.cu failed: {e}",
+            "dense paged KV cache: 2.5x more KV memory and slower long-context decode (up to -40% throughput at 24k)",
+            "the JIT needs an nvcc of torch's CUDA major (torch.version.cuda); "
+            "set OLALA_JIT_CUDA_HOME to such a toolkit",
+        )
         return False
     return True
 

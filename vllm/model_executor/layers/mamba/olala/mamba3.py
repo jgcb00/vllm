@@ -28,6 +28,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
     cuda_step_supported,
@@ -911,15 +912,23 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         )
         y = out.view(out.shape[0], H, D) if y_is_out else torch.empty_like(x)
 
-        use_cuda_step = (
-            fuse_rotary
-            and cuda_step_enabled()
-            and B.dtype == torch.bfloat16
+        use_cuda_step = fuse_rotary and cuda_step_enabled()
+        if use_cuda_step and not (
+            B.dtype == torch.bfloat16
             and cuda_step_supported(
                 ssm_pool, k_pool, v_pool, angle_pool, B[:, :, 0], C[:, :, 0], angle[:, 0],
                 H, D, S, R, self.num_rope_angles,
             )
-        )
+        ):
+            use_cuda_step = False
+            warn_slow_path(
+                "CUDA Mamba-3 decode step not applicable",
+                f"shapes/dtypes outside the kernel (H={H} D={D} S={S} R={R} "
+                f"angles={self.num_rope_angles}, B {B.dtype}, ssm pool "
+                f"{ssm_pool.dtype}); it implements H=48 D=64 S=128 R=4 angles=32",
+                "CuteDSL decode step: ~1.4x slower Mamba-3 decode step",
+                "none needed for correctness; the kernel only covers the Olala 7A1B shapes",
+            )
         if use_cuda_step:
             # Persistent CUDA step (tensor-core update + C dot, cp.async state pipeline).
             mamba3_step_cuda(

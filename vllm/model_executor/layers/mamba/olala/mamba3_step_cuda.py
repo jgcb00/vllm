@@ -21,6 +21,7 @@ from functools import lru_cache
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 
 logger = init_logger(__name__)
 
@@ -32,14 +33,27 @@ def cuda_step_enabled() -> bool:
     """OLALA_MAMBA3_STEP=cuda (default), on Hopper only (sm_90 SASS), and only
     if the JIT build succeeds; otherwise the CuteDSL step is used."""
     if os.environ.get(_ENV, "cuda") != "cuda":
+        logger.info("Olala: CUDA Mamba-3 step disabled by %s.", _ENV)
         return False
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
-        logger.warning("Olala: CUDA Mamba-3 step needs an sm_90 GPU; using CuteDSL.")
+        cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+        warn_slow_path(
+            "CUDA Mamba-3 decode step disabled",
+            f"the kernel is built for sm_90 (Hopper) only; this GPU is sm_{cap}",
+            "CuteDSL decode step: ~1.4x slower Mamba-3 decode step (-10 to -15% decode throughput)",
+            "run on H100/H200/GH200 (nothing to fix elsewhere; output is correct)",
+        )
         return False
     try:
         _load()
     except Exception as e:  # noqa: BLE001 - any build/load failure falls back
-        logger.warning("Olala: CUDA Mamba-3 step unavailable (%s); using CuteDSL.", e)
+        warn_slow_path(
+            "CUDA Mamba-3 decode step disabled",
+            f"JIT build of mamba3_step.cu failed: {e}",
+            "CuteDSL decode step: ~1.4x slower Mamba-3 decode step (-10 to -15% decode throughput)",
+            "the JIT needs an nvcc of torch's CUDA major (torch.version.cuda); "
+            "set OLALA_JIT_CUDA_HOME to such a toolkit",
+        )
         return False
     return True
 

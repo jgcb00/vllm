@@ -30,6 +30,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
     tpa_diff_combine,
@@ -297,18 +298,33 @@ class OlalaDiffTPAAttention(PluggableLayer):
 
         # TPA-factorized paged KV cache (2.5x smaller than dense K/V): needs
         # the exact Olala V-layer recipe the decode kernel implements.
-        self.factor_mode = (
-            factor_cache_enabled()
-            and tp == 1
-            and self.token_shift
-            and self.qk_norm
-            and bool(getattr(config, "scalable_softmax", False))
-            and float(getattr(config, "rope_theta", 0.0) or 0.0) == 0.0
-            and self.num_attention_heads == FACTOR_HQ
-            and self.num_kv_heads == FACTOR_HKV
-            and self.rank == 4
-            and self.head_dim == 128
-        )
+        self.factor_mode = False
+        if factor_cache_enabled():
+            unmet = [
+                name
+                for name, ok in (
+                    (f"tensor_parallel_size == 1 (got {tp})", tp == 1),
+                    ("token_shift", self.token_shift),
+                    ("qk_norm", self.qk_norm),
+                    ("scalable_softmax", bool(getattr(config, "scalable_softmax", False))),
+                    ("rope_theta == 0", float(getattr(config, "rope_theta", 0.0) or 0.0) == 0.0),
+                    (f"heads {FACTOR_HQ}/{FACTOR_HKV}/rank 4/head_dim 128",
+                     (self.num_attention_heads, self.num_kv_heads, self.rank, self.head_dim)
+                     == (FACTOR_HQ, FACTOR_HKV, 4, 128)),
+                )
+                if not ok
+            ]
+            self.factor_mode = not unmet
+            if unmet:
+                warn_slow_path(
+                    "TPA factor KV cache disabled",
+                    "this layer/deployment does not meet: " + ", ".join(unmet),
+                    "dense paged KV cache: 2.5x more KV memory and slower "
+                    "long-context decode (up to -40% throughput at 24k)",
+                    "serve with --tensor-parallel-size 1 (data-parallel replicas "
+                    "instead) if TP is the reason; otherwise the checkpoint's "
+                    "attention recipe is not the one the kernel implements",
+                )
 
         if self.token_shift:
             self.shift_proj_k = column(self.num_kv_heads, "shift_proj_k")
