@@ -1,4 +1,26 @@
 <!-- markdownlint-disable MD001 MD041 -->
+## Olala fork: environment variables
+
+This branch (`dragon-v0.26`) adds the Olala hybrid model (Mamba-3 MIMO + Differential TPA + latent MoE).
+Its kernels and fast paths are controlled by the variables below; every default is the tuned production setting.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OLALA_TPA_FACTOR` | `1` | TPA-factorized paged KV cache for the DiffTPA layers (stores the rank-4 factors, 2.5x smaller than dense K/V) with the wgmma decode-attention kernel. `0` = dense paged KV + standard attention backend. Not compatible with speculative decoding (use `0` with spec decode). |
+| `OLALA_MAMBA3_STEP` | `cuda` | Mamba-3 decode step: `cuda` = persistent CUDA kernel (bf16 and fp32 state); any other value = CuteDSL step from `mamba_ssm`. |
+| `OLALA_GROUPED_PREFILL` | `1` | Group-parallel exact Mamba-3 varlen prefill (needs `mamba_ssm` branch `mamba3-prefill-opt`); `0` = stock kernel. |
+| `OLALA_CHUNKED_PREFILL` | unset | `1` opts into chunked prefill (needs a `mamba3_mimo` with `Input_States`). Off by default: it mixes prefill with decodes, leaves the FULL-decode CUDA-graph regime and costs throughput under concurrency. |
+| `OLALA_GEMV` | `1` | Single-token Triton GEMV for decode projections; `0` = regular GEMM. |
+| `OLALA_TPA_CONCAT` | `1` | One GEMM over the concatenated DiffTPA input projections; `0` = separate projections. |
+| `OLALA_MOE_SMALL` | `1` | Small-batch latent-MoE decode path (gather-GEMV kernels); `0` = generic fused-MoE pipeline. |
+| `OLALA_TPA_BUILD_DIR` | `~/.cache/olala_tpa_factor` | JIT build directory of the CUDA extensions (TPA decode attention, Mamba-3 step). |
+| `OLALA_TPA_DEBUG` | unset | Debug: `1` prints the factor-cache layout once; `2` also reports NaNs in the decode-attention output. |
+| `OLALA_TPA_FACTOR_DECODE_DENSE` | unset | Debug: `1` routes factor-mode decode through the reference reconstruct + dense-attention path. |
+
+The Mamba-3 SSM state is stored in **fp32** by default (`--mamba-ssm-cache-dtype auto`): bf16 storage drifts over
+long generations (repetition loops). `--mamba-ssm-cache-dtype bfloat16` is ~15% faster at high concurrency.
+Checkpoints converted before the Olala rename (`DragonForCausalLM`) still load.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
