@@ -494,6 +494,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 FROM base AS build
 ARG TARGETPLATFORM
 
+# Fork builds have no upstream tags: pin the wheel version (verl needs >= 0.18)
+ARG VLLM_VERSION_OVERRIDE=""
+ENV VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}
+
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ARG PYTORCH_CUDA_INDEX_BASE_URL

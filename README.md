@@ -26,6 +26,26 @@ The Mamba-3 MIMO inference kernels are vendored in `vllm/model_executor/layers/m
 (forward only, next to the Mamba-2 ops): **`mamba_ssm` is not needed**. They use `tilelang`,
 `nvidia-cutlass-dsl` and `quack-kernels`, already in vLLM's CUDA requirements.
 
+### Docker image
+
+The fork changes no `csrc/`, so the image reuses the precompiled upstream binaries of its base commit:
+
+```bash
+DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile --target vllm-openai \
+  --build-arg VLLM_USE_PRECOMPILED=1 \
+  --build-arg VLLM_MERGE_BASE_COMMIT=568afb3a13806beb53bb2e6bd518269357b237c0 \
+  --build-arg VLLM_VERSION_OVERRIDE=0.26.0 \
+  --build-arg RUN_WHEEL_CHECK=false \
+  -t olala-vllm:dragon-v0.26 .
+
+docker run --rm --gpus all --ipc=host -p 8000:8000 \
+  -v /path/to/checkpoint:/model:ro -v olala-jit:/root/.cache \
+  olala-vllm:dragon-v0.26 /model --trust-remote-code --served-model-name olala
+```
+
+The TPA-factor decode and Mamba-3 step CUDA extensions are JIT-built (nvcc, sm_90) on first use;
+the `olala-jit` volume keeps them across container restarts.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
