@@ -522,9 +522,10 @@ class Mamba3Step():
                 a_proj = cute.math.tanh(
                     Float32(gAngleProj[tidx]), fastmath=False
                 )
-                sAngles[tidx] = (
-                    Float32(gAnglePool[tidx])
-                    + a_proj * dt_val * 3.141592653589793
+                th = Float32(gAnglePool[tidx]) + a_proj * dt_val * 3.141592653589793
+                # carried phase wrapped to [0, 2*pi), as in prefill (fp32 precision)
+                sAngles[tidx] = th - 6.283185307179586 * cute.math.floor(
+                    th / 6.283185307179586
                 )
             cute.arch.sync_threads()
 

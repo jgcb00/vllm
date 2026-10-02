@@ -178,3 +178,85 @@ def test_split_policy(lens: list[int], expected: bool, monkeypatch):
 
     monkeypatch.setattr(mimo, "_sm_count", lambda device: 132)
     assert mimo._split_pays(lens, H, torch.device("cuda")) is expected
+
+
+def _wrapped_err(x: torch.Tensor, ref: torch.Tensor) -> float:
+    d = torch.remainder(x.double() - ref, 2 * torch.pi)
+    return torch.minimum(d, 2 * torch.pi - d).max().item()
+
+
+@torch.inference_mode()
+def test_decode_phase_matches_prefill_long_context():
+    """The rotary phase is a running sum over the whole context: after 16k
+    tokens the decode steps (CUDA, CuteDSL, Triton rotary) and the prefill
+    angle_dt must all sit within 1e-4 rad of the fp64 phase, so prefill and
+    decode do not drift apart with the context length."""
+    from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
+        mamba3_step_cuda,
+    )
+    from vllm.model_executor.layers.mamba.ops.mamba3.angle_dt import angle_dt_fwd
+    from vllm.model_executor.layers.mamba.ops.mamba3.rotary_step import (
+        apply_rotary_qk_inference_fwd,
+    )
+    from vllm.model_executor.layers.mamba.ops.mamba3.step_cute import mamba3_step_fn
+
+    g = torch.Generator(device="cuda").manual_seed(3)
+    L = 16384
+
+    def rn(*s):
+        return torch.randn(*s, device="cuda", generator=g)
+
+    angp = rn(L, A).bfloat16()  # decode projections are bf16
+    dt = torch.nn.functional.softplus(-3.0 + rn(L, H))
+    inc = torch.tanh(angp.double())[:, None, :] * torch.pi * dt.double()[..., None]
+    ref = inc.sum(0)  # (H, A), unwrapped fp64 phase after L tokens
+
+    prefill = angle_dt_fwd(
+        angp.float()[None, :, None, :].expand(1, L, H, A).contiguous(),
+        dt.T[None].contiguous(), chunk_size=CHUNK, return_output_state=True,
+    )[1]  # fmt: skip
+    assert _wrapped_err(prefill[0], ref) < 1e-4
+
+    # decode steps from a zero phase; only the angle state matters here
+    a = -torch.full((1, H), 0.5, device="cuda")
+    b, c = rn(1, R, N).bfloat16(), rn(1, R, N).bfloat16()
+    d, x, z = rn(H), rn(1, H, P).bfloat16(), rn(1, H, P).bfloat16()
+    trap = torch.rand(1, H, device="cuda", generator=g)
+    xpj, opj, zpj = rn(R, H, P), rn(R, H, P), rn(R, H, P)
+    bq, bk = rn(R, H, N), rn(R, H, N)
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    pools = {
+        k: dict(ssm=torch.zeros(1, H, P, N, device="cuda"),
+                kp=torch.zeros(1, R, H, N, device="cuda").bfloat16(),
+                vp=torch.zeros(1, H, P, device="cuda").bfloat16(),
+                ang=torch.zeros(1, H, A, device="cuda"))
+        for k in ("cuda", "cute")
+    }  # fmt: skip
+    ang_tri = torch.zeros(1, H, A, device="cuda")
+    q = torch.zeros(1, R, H, N, device="cuda").bfloat16()
+    y = torch.empty(1, H, P, device="cuda", dtype=torch.bfloat16)
+    for t in range(L):
+        dtt, apt = dt[t : t + 1].contiguous(), angp[t : t + 1]
+        p = pools["cuda"]
+        mamba3_step_cuda(
+            p["ssm"], p["kp"], p["vp"], p["ang"], a, b, c, d, x, dtt, trap,
+            xpj, zpj, opj, z, bq, bk, apt, slots, y,
+        )  # fmt: skip
+        p = pools["cute"]
+        mamba3_step_fn(
+            p["ssm"], p["kp"], p["vp"], a,
+            b.unsqueeze(2).expand(1, R, H, N), c.unsqueeze(2).expand(1, R, H, N),
+            d, x, dtt, trap, xpj, opj, None, y,
+            z=z, zproj=zpj, state_batch_indices=slots, update_kv_state=True,
+            tile_D=64, num_warps=4, rotary_dim=2 * A, rotary_bias_q=bq,
+            rotary_bias_k=bk, rotary_angle_proj=apt.unsqueeze(1).expand(1, H, A),
+            rotary_angle_state=p["ang"],
+        )  # fmt: skip
+        _, _, ang_tri = apply_rotary_qk_inference_fwd(
+            q, q, ang_tri, apt.float().unsqueeze(1).expand(1, H, A).contiguous(), dtt
+        )
+    for name, got in (("cuda", pools["cuda"]["ang"]), ("cute", pools["cute"]["ang"]),
+                      ("triton", ang_tri)):  # fmt: skip
+        assert got.abs().max() < 2 * torch.pi + 1e-3, f"{name}: phase not wrapped"
+        assert _wrapped_err(got[0], ref) < 1e-4, name
+        assert _wrapped_err(got[0], prefill[0].double()) < 1e-4, name

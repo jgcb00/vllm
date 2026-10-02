@@ -94,6 +94,9 @@ def rotary_qk_inference_kernel(
     # Match angle_dt: tanh(angle_proj) * dt * pi
     angle_proj = tl.sigmoid(2.0 * angle_proj) * 2.0 - 1.0  # tanh
     angle = angle_state + angle_proj * dt * 3.141592653589793  # (rotary_dim // 2)
+    # Keep the carried phase in [0, 2*pi) like prefill: unwrapped, it grows with
+    # the context and fp32 loses ~5e-4 rad of it by 32k tokens.
+    angle = angle - 6.283185307179586 * tl.floor(angle / 6.283185307179586)
 
     OUT_ANGLE_STATE = OUT_ANGLE_STATE + rd_half * stride_out_angle_state[2]
     # NOTE: the angle store is deferred to the END of the kernel. When the

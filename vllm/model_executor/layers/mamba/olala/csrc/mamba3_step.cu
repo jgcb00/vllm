@@ -128,7 +128,8 @@ template <bool F32> __global__ void __launch_bounds__(THREADS, STEP_MINB) mamba3
     Stage<F32>& st = S_.st[k % kStages<F32>];
     const float alpha = __expf(A * dt), gamma = trap * dt, beta = (1.f - trap) * dt * alpha;
     // ---- preamble: angles, bias + rotary on B/C (bf16-rounded)
-    if (t < NA) { const float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; S_.sTheta[t] = th; __sincosf(fmodf(th, 6.283185307179586f), &S_.sSin[t], &S_.sCos[t]); }
+    // carried phase wrapped to [0, 2*pi) as in prefill: unwrapped it grows with the context and loses fp32 precision
+    if (t < NA) { float th = st.angst[t] + tanhf(bf2f(st.angp[t])) * dt * 3.14159265358979323846f; th -= 6.283185307179586f * floorf(th / 6.283185307179586f); S_.sTheta[t] = th; sincosf(th, &S_.sSin[t], &S_.sCos[t]); }
     __syncthreads();
 #ifndef V_NOPRE
     for (int i = t; i < R * (S / 2); i += THREADS) {
