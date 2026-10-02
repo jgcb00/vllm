@@ -660,7 +660,10 @@ class DelegatingParser(Parser):
         supports_required_and_named = self._tool_parser.supports_required_and_named
 
         if request.tool_choice == "none":
-            if self._engine_based:
+            if (
+                self._engine_based
+                or self._tool_parser.parse_content_when_tool_choice_none
+            ):
                 # Engine-backed parsers route content extraction through
                 # extract_tool_calls_streaming, so run the full pipeline
                 # and strip tool_calls after.
@@ -675,6 +678,13 @@ class DelegatingParser(Parser):
                 )
                 if delta_message:
                     delta_message.tool_calls = []
+                    if (
+                        not self._engine_based
+                        and not delta_message.content
+                        and not delta_message.reasoning
+                    ):
+                        # Only a (dropped) tool-call delta: emit no chunk.
+                        delta_message = None
                 return delta_message, False
             return (DeltaMessage(content=delta_text) if delta_text else None), False
 

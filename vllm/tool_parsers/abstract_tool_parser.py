@@ -61,6 +61,11 @@ class ToolParser:
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None
     engine_based_streaming: bool = False
+    # When True, streaming requests with tool_choice="none" still run through
+    # extract_tool_calls_streaming() and only the tool calls are dropped.
+    # Set it when the raw model text carries markup that only the tool parser
+    # strips (e.g. channel markers); otherwise "none" streams raw delta_text.
+    parse_content_when_tool_choice_none: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
