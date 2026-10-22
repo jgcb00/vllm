@@ -45,6 +45,7 @@ from vllm.model_executor.layers.mamba.olala.tpa_factor import (
     factor_rows,
     num_splits_for_batch,
     reconstruct_dense_batched,
+    reconstruct_dense_kv,
     write_rows,
 )
 from vllm.v1.attention.backends.fa_utils import (
@@ -672,8 +673,11 @@ class OlalaDiffTPAAttention(PluggableLayer):
         q = self._q_for_attention(q_all, positions)
         lengths = [int(x) for x in seq_lens_cpu]
         bt_rows = md.block_table[bt0 : bt0 + nreq]
-        k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
-        v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
+        if os.environ.get("OLALA_TPA_RECON_TORCH") == "1":  # reference path (A/B checks)
+            k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
+            v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
+        else:
+            k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
         cu_k = [0]
         for L in lengths:
             cu_k.append(cu_k[-1] + L)

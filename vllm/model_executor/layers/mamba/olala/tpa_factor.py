@@ -335,8 +335,69 @@ def reconstruct_dense(plane: torch.Tensor, blocks: torch.Tensor, length: int) ->
     return reconstruct_dense_batched(plane, blocks.unsqueeze(0), [length])
 
 
+@triton.jit
+def _reconstruct_dense_kernel(
+    k_plane_ptr, v_plane_ptr, bt_ptr, starts_ptr, lens_ptr, k_out_ptr, v_out_ptr,
+    plane_bstride, bt_stride, block_size,
+    HKV_: tl.constexpr, R_: tl.constexpr, D_: tl.constexpr, OFF_C_: tl.constexpr, OFF_D_: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """One program per (request, BT-token tile): dense K and V rows of every kv head,
+    out[t, h] = sum_r C[t, h, r] B[t, r] + D[t, h, r] B[t-1, r] (B[-1] = 0 at a request start), fp32 accumulate."""
+    req = tl.program_id(0)
+    tile = tl.program_id(1)
+    n = tl.load(lens_ptr + req)
+    t = tile * BT + tl.arange(0, BT)
+    if tile * BT >= n:
+        return
+    tmask = t < n
+    tp = tl.maximum(t - 1, 0)
+    blk = tl.load(bt_ptr + req * bt_stride + t // block_size, mask=tmask, other=0).to(tl.int64)
+    blkp = tl.load(bt_ptr + req * bt_stride + tp // block_size, mask=tmask, other=0).to(tl.int64)
+    row = blk * plane_bstride + (t % block_size).to(tl.int64) * (OFF_D_ + HKV_ * R_)
+    rowp = blkp * plane_bstride + (tp % block_size).to(tl.int64) * (OFF_D_ + HKV_ * R_)
+    has_prev = (t > 0) & tmask
+    d = tl.arange(0, D_)
+    obase = (tl.load(starts_ptr + req) + t).to(tl.int64)
+    for which in tl.static_range(2):
+        pl = k_plane_ptr if which == 0 else v_plane_ptr
+        op = k_out_ptr if which == 0 else v_out_ptr
+        for h in tl.static_range(HKV_):
+            acc = tl.zeros([BT, D_], dtype=tl.float32)
+            for r in tl.static_range(R_):
+                b = tl.load(pl + row[:, None] + r * D_ + d[None, :], mask=tmask[:, None], other=0.0).to(tl.float32)
+                bp = tl.load(pl + rowp[:, None] + r * D_ + d[None, :], mask=has_prev[:, None], other=0.0).to(tl.float32)
+                c = tl.load(pl + row + OFF_C_ + h * R_ + r, mask=tmask, other=0.0).to(tl.float32)
+                dc = tl.load(pl + row + OFF_D_ + h * R_ + r, mask=tmask, other=0.0).to(tl.float32)
+                acc += c[:, None] * b + dc[:, None] * bp
+            tl.store(op + (obase[:, None] * HKV_ + h) * D_ + d[None, :], acc.to(op.dtype.element_ty), mask=tmask[:, None])
+
+
+def reconstruct_dense_kv(kplane: torch.Tensor, vplane: torch.Tensor, block_tables: torch.Tensor,
+                         lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dense (sum(lengths), HKV, D) K and V of several requests, concatenated, in one kernel."""
+    total = sum(lengths)
+    dev = kplane.device
+    assert kplane.stride(1) == ROWP and kplane.stride(2) == 1 and vplane.stride(0) == kplane.stride(0)
+    k_out = torch.empty(total, HKV, HEAD_DIM, dtype=kplane.dtype, device=dev)
+    v_out = torch.empty(total, HKV, HEAD_DIM, dtype=vplane.dtype, device=dev)
+    starts = [0]
+    for L in lengths[:-1]:
+        starts.append(starts[-1] + L)
+    meta = torch.tensor([starts, lengths], dtype=torch.int32).to(dev, non_blocking=True)
+    BT = 32
+    grid = (len(lengths), triton.cdiv(max(lengths), BT))
+    _reconstruct_dense_kernel[grid](
+        kplane, vplane, block_tables, meta[0], meta[1], k_out, v_out,
+        kplane.stride(0), block_tables.stride(0), kplane.shape[1],
+        HKV_=HKV, R_=RANK, D_=HEAD_DIM, OFF_C_=OFF_C, OFF_D_=OFF_D, BT=BT, num_warps=4,
+    )
+    return k_out, v_out
+
+
 def reconstruct_dense_batched(plane: torch.Tensor, block_tables: torch.Tensor, lengths: list[int]) -> torch.Tensor:
-    """Dense (sum(lengths), H, D) K or V of several requests, concatenated.
+    """Dense (sum(lengths), H, D) K or V of several requests, concatenated (torch reference;
+    the prefill path uses the fused :func:`reconstruct_dense_kv`).
 
     ``block_tables[r]`` is request ``r``'s block table row; one gather over
     the plane, one unswizzle and two einsums for the whole batch.
