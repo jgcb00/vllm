@@ -75,7 +75,6 @@ _FUSE_ROTARY_MAX_BATCH = 64
 # kernel needs tilelang and the step kernel the CuTe DSL.
 _mamba3_mimo = None
 _mamba3_mimo_grouped = None
-_mamba3_mimo_hybrid = None
 _mamba3_mimo_hybrid_pools = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
@@ -86,7 +85,7 @@ def _is_pow2(n: int) -> bool:
 
 
 def _lazy_import_kernels() -> None:
-    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid, _mamba3_mimo_hybrid_pools
+    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid_pools
     if os.environ.get("OLALA_SYNC_DEBUG") == "1" and not getattr(torch, "_olala_sync_dbg", False):  # debug: report host syncs (warn)
         torch._olala_sync_dbg = True
         torch.cuda.set_sync_debug_mode("warn")
@@ -116,12 +115,8 @@ def _lazy_import_kernels() -> None:
     # 128-token chunks): every chunk of every sequence runs in parallel. OLALA_M3_PREFILL=tilelang
     # restores the serial-per-sequence path.
     if os.environ.get("OLALA_M3_PREFILL", "hybrid") == "hybrid":
-        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import (
-            mamba3_mimo_hybrid,
-            mamba3_mimo_hybrid_pools,
-        )
+        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import mamba3_mimo_hybrid_pools
 
-        _mamba3_mimo_hybrid = mamba3_mimo_hybrid
         _mamba3_mimo_hybrid_pools = mamba3_mimo_hybrid_pools
 
 
