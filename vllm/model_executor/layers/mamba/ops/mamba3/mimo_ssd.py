@@ -1086,6 +1086,29 @@ def _ssd_pool_tail(
     tl.store(v_pool + slot * s_v + h * P + p, tl.load(X_ptr + ((e - 1) * H + h) * P + p))
 
 
+_LAYOUT_CACHE: dict = {}
+
+
+def _layout_meta(cu: tuple, chunk_tokens: int, dev):
+    """Chunk layout of a batch as one device int32 tensor, cached: every Mamba layer of a step
+    (and steps with the same layout) reuse it instead of rebuilding and uploading it."""
+    key = (cu, chunk_tokens, dev)
+    hit = _LAYOUT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    cu_l = list(cu)
+    starts, lens, sends, lasts, seq_c0, seq_nc = _chunk_layout(cu_l, chunk_tokens)
+    NC, NS = len(starts), len(cu_l) - 1
+    last_rows = [seq_c0[s] + seq_nc[s] - 1 for s in range(NS)]
+    meta = torch.tensor(starts + lens + sends + lasts + seq_c0 + seq_nc + cu_l[:-1]
+                        + starts + [cu_l[-1]] + last_rows + cu_l[1:],
+                        dtype=torch.int32).to(dev, non_blocking=True)
+    if len(_LAYOUT_CACHE) > 64:
+        _LAYOUT_CACHE.clear()
+    _LAYOUT_CACHE[key] = (NC, NS, meta)
+    return NC, NS, meta
+
+
 _ZERO_KV: dict = {}
 
 
@@ -1119,12 +1142,7 @@ def mamba3_mimo_hybrid_pools(
     H, P = V.shape[1], V.shape[2]
     NQ = N // 4
     dev = Q.device
-    starts, lens, sends, lasts, seq_c0, seq_nc = _chunk_layout(cu_seqlens_cpu, chunk_tokens)
-    NC, NS = len(starts), len(cu_seqlens_cpu) - 1
-    last_rows = [seq_c0[s] + seq_nc[s] - 1 for s in range(NS)]
-    meta = torch.tensor(starts + lens + sends + lasts + seq_c0 + seq_nc + cu_seqlens_cpu[:-1]
-                        + starts + [cu_seqlens_cpu[-1]] + last_rows + cu_seqlens_cpu[1:],
-                        dtype=torch.int32).to(dev, non_blocking=True)
+    NC, NS, meta = _layout_meta(tuple(cu_seqlens_cpu), chunk_tokens, dev)
     o = 0
     def take(k):
         nonlocal o
