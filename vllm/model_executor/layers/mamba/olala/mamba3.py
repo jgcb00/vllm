@@ -75,6 +75,7 @@ _FUSE_ROTARY_MAX_BATCH = 64
 # kernel needs tilelang and the step kernel the CuTe DSL.
 _mamba3_mimo = None
 _mamba3_mimo_grouped = None
+_mamba3_mimo_hybrid = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
 
@@ -84,7 +85,7 @@ def _is_pow2(n: int) -> bool:
 
 
 def _lazy_import_kernels() -> None:
-    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn
+    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid
     global _apply_rotary_qk_inference_fwd
     if _mamba3_mimo is not None:
         return
@@ -107,6 +108,13 @@ def _lazy_import_kernels() -> None:
     # OLALA_GROUPED_PREFILL=0.
     if os.environ.get("OLALA_GROUPED_PREFILL", "1") != "0":
         _mamba3_mimo_grouped = mamba3_mimo_varlen_grouped
+    # Chunk-parallel exact prefill (Triton chunk-state phases + one TileLang pass over
+    # 128-token chunks): every chunk of every sequence runs in parallel. OLALA_M3_PREFILL=tilelang
+    # restores the serial-per-sequence path.
+    if os.environ.get("OLALA_M3_PREFILL", "hybrid") == "hybrid":
+        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import mamba3_mimo_hybrid
+
+        _mamba3_mimo_hybrid = mamba3_mimo_hybrid
 
 
 @triton.jit
@@ -598,6 +606,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
     ) -> None:
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
+        if _mamba3_mimo_hybrid is not None:
+            self._prefill_hybrid(z, x, dt, A, trap, B, C, angle, out, slots, qsl, pools, init_states, qsl_cpu)
+            return
         z = z.unsqueeze(0)  # (1, T, H, p)
         x = x.unsqueeze(0)  # (1, T, H, p)
         dt = dt.unsqueeze(0).to(torch.float32)  # (1, T, H)
@@ -682,6 +693,46 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         v_pool[slots] = x[0, qsl[1:].long() - 1].to(v_pool.dtype)
 
         y = rearrange(Out.squeeze(0), "t h p -> t (h p)")
+        if self._postgate_norm:
+            y = self.output_norm(y)
+        out.copy_(y.to(out.dtype))
+
+    def _prefill_hybrid(self, z, x, dt, A, trap, B, C, angle, out, slots, qsl, pools, init_states, qsl_cpu):
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        T = x.shape[0]
+        B = self.B_norm(B.unsqueeze(0))  # (1, T, R, G, N)
+        C = self.C_norm(C.unsqueeze(0))
+        _A = torch.clamp(-F.softplus(A.to(torch.float32)), max=-self.A_floor)  # (T, H)
+        DT = F.softplus(dt.to(torch.float32) + self.dt_bias)
+        ADT = (_A * DT).t().contiguous()  # (H, T)
+        DT = DT.t().contiguous()
+        trap = trap.t().contiguous()
+        cw = self._prefill_const_w
+        if cw is None:
+            cw = (
+                self.C_bias.to(torch.float32),
+                self.B_bias.to(torch.float32),
+                self.in_proj_mimo_x.to(torch.float32),
+                self.in_proj_mimo_z.to(torch.float32),
+                self.out_proj_mimo.to(torch.float32),
+                self.D.to(torch.float32),
+            )
+            self._prefill_const_w = cw
+        q_bias, k_bias, mimo_v, mimo_z, mimo_out, d_f32 = cw
+        if qsl_cpu is None:
+            qsl_cpu = qsl.cpu()
+        cu = [int(v) for v in qsl_cpu.tolist()]
+        Out, Final_Angle, Final_SSM, Final_K = _mamba3_mimo_hybrid(
+            C.reshape(T, self.mimo_dim, self.d_state).contiguous().bfloat16(),
+            B.reshape(T, self.mimo_dim, self.d_state).contiguous().bfloat16(),
+            x.contiguous().bfloat16(), z.contiguous(), angle.to(torch.float32), DT, ADT, trap,
+            q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu, init_states=init_states,
+        )
+        angle_pool[slots] = Final_Angle.to(angle_pool.dtype)
+        ssm_pool[slots] = Final_SSM.to(ssm_pool.dtype)
+        k_pool[slots] = Final_K.to(k_pool.dtype)
+        v_pool[slots] = x[qsl[1:].long() - 1].to(v_pool.dtype)
+        y = Out.reshape(T, -1)
         if self._postgate_norm:
             y = self.output_norm(y)
         out.copy_(y.to(out.dtype))

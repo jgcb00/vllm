@@ -188,6 +188,7 @@ def _ssd_state_pass(
     Sin_ptr, Ain_ptr, fin_ssm_ptr, fin_ang_ptr,
     T, H,
     HAS_INIT: tl.constexpr, R: tl.constexpr, N: tl.constexpr, P: tl.constexpr, NQ: tl.constexpr,
+    SIN_T: tl.constexpr = False,
 ):
     h = tl.program_id(0)
     s = tl.program_id(1)
@@ -223,10 +224,16 @@ def _ssd_state_pass(
     for j in range(0, nc):
         c = c0 + j
         ob = Sin_ptr + (c * H + h).to(tl.int64) * N * P
-        tl.store(ob + nq[:, None] * P + p[None, :], st0.to(tl.bfloat16))
-        tl.store(ob + (NQ + nq[:, None]) * P + p[None, :], st1.to(tl.bfloat16))
-        tl.store(ob + (2 * NQ + nq[:, None]) * P + p[None, :], st2.to(tl.bfloat16))
-        tl.store(ob + (3 * NQ + nq[:, None]) * P + p[None, :], st3.to(tl.bfloat16))
+        if SIN_T:  # (NC, H, P, N) fp32: the TileLang kernel's INIT_SSM_STATE layout
+            tl.store(ob + p[None, :] * N + nq[:, None], st0)
+            tl.store(ob + p[None, :] * N + NQ + nq[:, None], st1)
+            tl.store(ob + p[None, :] * N + 2 * NQ + nq[:, None], st2)
+            tl.store(ob + p[None, :] * N + 3 * NQ + nq[:, None], st3)
+        else:
+            tl.store(ob + nq[:, None] * P + p[None, :], st0.to(tl.bfloat16))
+            tl.store(ob + (NQ + nq[:, None]) * P + p[None, :], st1.to(tl.bfloat16))
+            tl.store(ob + (2 * NQ + nq[:, None]) * P + p[None, :], st2.to(tl.bfloat16))
+            tl.store(ob + (3 * NQ + nq[:, None]) * P + p[None, :], st3.to(tl.bfloat16))
         tl.store(Ain_ptr + (c * H + h) * NQ + nq, th)
         lb = Sloc_ptr + (c * H + h).to(tl.int64) * N * P
         l0 = tl.load(lb + nq[:, None] * P + p[None, :])
@@ -673,6 +680,85 @@ def _ssd_chunk_scan_bp(
         st1 = dec * st1 + tl.dot(tl.trans((k1.to(tl.float32) * w[:, None]).to(tl.bfloat16)), psiv)
         st2 = dec * st2 + tl.dot(tl.trans((k2.to(tl.float32) * w[:, None]).to(tl.bfloat16)), psiv)
         st3 = dec * st3 + tl.dot(tl.trans((k3.to(tl.float32) * w[:, None]).to(tl.bfloat16)), psiv)
+
+
+@triton.jit
+def _ssd_abs_angles(thl_ptr, Ain_ptr, ch_start_ptr, ch_len_ptr, out_ptr, H, NQ: tl.constexpr, LS: tl.constexpr):
+    c = tl.program_id(0)
+    h = tl.program_id(1)
+    cs = tl.load(ch_start_ptr + c)
+    cl = tl.load(ch_len_ptr + c)
+    i = tl.arange(0, LS)
+    nq = tl.arange(0, NQ)
+    off = ((cs + i)[:, None] * H + h) * NQ + nq[None, :]
+    a = tl.load(thl_ptr + off, mask=(i < cl)[:, None], other=0.0) + tl.load(Ain_ptr + (c * H + h) * NQ + nq)[None, :]
+    tl.store(out_ptr + off, _mod2pi(a), mask=(i < cl)[:, None])
+
+
+@torch.no_grad()
+def mamba3_mimo_hybrid(
+    Q, K, V, Z, angles, DT, ADT, Trap, q_bias, k_bias, psi, phi, zeta, D,
+    cu_seqlens_cpu: list[int],
+    init_states=None,
+    chunk_tokens: int = 128,
+    tl_chunk: int = 16,
+    tl_threads: int = 128,
+    tl_stages: int = 0,
+):
+    """Chunk-parallel exact prefill: the Triton phases give every LS-token chunk its entering state
+    and absolute phases, then the TileLang chunked-scan kernel runs once over the chunks as
+    independent virtual sequences (zero boundary K/V fold: the entering state already holds the
+    previous token's full trapezoid contribution). Same contract as :func:`mamba3_mimo_ssd`."""
+    from .mimo_fwd_varlen import mamba_mimo_forward_varlen
+    from .segsum import compute_dacs_segsum_triton_varlen
+    T, R, N = Q.shape
+    H, P = V.shape[1], V.shape[2]
+    NQ = N // 4
+    dev = Q.device
+    starts, lens, sends, lasts, seq_c0, seq_nc = _chunk_layout(cu_seqlens_cpu, chunk_tokens)
+    NC, NS = len(starts), len(cu_seqlens_cpu) - 1
+    v_cu_list = starts + [cu_seqlens_cpu[-1]]
+    meta = torch.tensor([starts, lens, sends, lasts], dtype=torch.int32).to(dev, non_blocking=True)
+    smeta = torch.tensor([seq_c0, seq_nc, cu_seqlens_cpu[:-1]], dtype=torch.int32).to(dev, non_blocking=True)
+    v_cu = torch.tensor(v_cu_list, dtype=torch.int32).to(dev, non_blocking=True)
+    f32 = dict(device=dev, dtype=torch.float32)
+    dacs, ts, gam = torch.empty(H, T, **f32), torch.empty(H, T, **f32), torch.empty(H, T, **f32)
+    cl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
+    sl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
+    thl = torch.empty(T, H, NQ, **f32)
+    dtot, asum = torch.empty(NC, H, **f32), torch.empty(NC, H, NQ, **f32)
+    Sloc = torch.empty(NC, H, N, P, **f32)
+    SinT = torch.empty(NC, H, P, N, **f32)
+    Ain = torch.empty(NC, H, NQ, **f32)
+    fin_ssm, fin_ang = torch.empty(NS, H, P, N, **f32), torch.empty(NS, H, NQ, **f32)
+    angles = angles.contiguous()
+    _ssd_prep[(NC, H)](angles, DT, ADT, Trap, meta[0], meta[1], meta[2], dacs, ts, gam, thl, dtot, asum, cl_t, sl_t,
+                       T, H, NQ=NQ, LS=chunk_tokens, num_warps=4)
+    _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, meta[0], meta[1], Sloc, T, H,
+                                 R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
+    has_init = init_states is not None
+    if has_init:
+        in_ang, in_ssm, in_k, in_v = (x.contiguous() for x in init_states)
+        in_ang, in_ssm = in_ang.float(), in_ssm.float()
+    else:
+        in_ang = in_ssm = in_k = in_v = Sloc  # unused
+    _ssd_state_pass[(H, NS)](
+        Sloc, dtot, asum, smeta[0], smeta[1], smeta[2], in_ssm, in_k, in_v, in_ang, psi, DT, Trap,
+        SinT, Ain, fin_ssm, fin_ang, T, H, HAS_INIT=has_init, R=R, N=N, P=P, NQ=NQ, SIN_T=True, num_warps=4,
+    )
+    ang_abs = torch.empty(T, H, NQ, **f32)
+    _ssd_abs_angles[(NC, H)](thl, Ain, meta[0], meta[1], ang_abs, H, NQ=NQ, LS=chunk_tokens, num_warps=4)
+    DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton_varlen(ADT.view(1, H, T), tl_chunk, cu_seqlens=v_cu)
+    zk = torch.zeros(NC, R, H, N, device=dev, dtype=Q.dtype)
+    zv = torch.zeros(NC, H, P, device=dev, dtype=V.dtype)
+    o, _, k_fin = mamba_mimo_forward_varlen(
+        Q.view(1, T, R, 1, N), K.view(1, T, R, 1, N), V.view(1, T, H, P), q_bias, k_bias, psi, phi,
+        Z.view(1, T, H, P), D, zeta, ang_abs.view(1, T, H, NQ), DA_CS, DA_CS_REV, DT.view(1, H, T), Trap.view(1, H, T),
+        Segsum, tl_chunk, 4, Q.dtype, cu_seqlens=v_cu, return_state=True, initial_states=(SinT, zk, zv),
+        threads=tl_threads, num_stages=tl_stages,
+    )
+    last_rows = torch.tensor([seq_c0[s] + seq_nc[s] - 1 for s in range(NS)], dtype=torch.long).to(dev, non_blocking=True)
+    return o.view(T, H, P), fin_ang, fin_ssm, k_fin[last_rows]
 
 
 def _chunk_layout(cu: list[int], ls: int):
