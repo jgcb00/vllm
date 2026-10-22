@@ -30,6 +30,10 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+import os as _os
+
+_TL_V2 = _os.environ.get("OLALA_TL_V2", "1") == "1"
+
 
 @triton.jit
 def _tanh(x):
@@ -46,6 +50,7 @@ def _ssd_prep(
     ang_ptr, DT_ptr, ADT_ptr, TRAP_ptr, ch_start_ptr, ch_len_ptr, ch_send_ptr,
     dacs_ptr, ts_ptr, gam_ptr, thl_ptr, dtot_ptr, asum_ptr, cl_ptr, sl_ptr,
     T, H, NQ: tl.constexpr, LS: tl.constexpr,
+    dcs16_ptr=None, dcsr16_ptr=None, G16: tl.constexpr = 0,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
@@ -63,6 +68,13 @@ def _ssd_prep(
     trn = tl.load(TRAP_ptr + h * T + t + 1, mask=nm, other=0.0).to(tl.float32)
     gam = dtv * tl.sigmoid(trv)
     tl.store(dacs_ptr + h * T + t, tl.cumsum(adt, axis=0), mask=tm)
+    if G16 > 0:
+        # TileLang chunk-of-G16 cumsums (compute_dacs_segsum_triton_varlen's da_cs / da_cs_rev, clipped <= 0)
+        a2 = tl.reshape(adt, (LS // G16, G16))
+        cs2 = tl.cumsum(a2, axis=1)
+        rev2 = tl.cumsum(a2, axis=1, reverse=True) - a2
+        tl.store(dcs16_ptr + h * T + t, tl.reshape(tl.minimum(cs2, 0.0), (LS,)), mask=tm)
+        tl.store(dcsr16_ptr + h * T + t, tl.reshape(tl.minimum(rev2, 0.0), (LS,)), mask=tm)
     tl.store(ts_ptr + h * T + t, gam + dtn * tl.sigmoid(-trn), mask=tm)
     tl.store(gam_ptr + h * T + t, gam, mask=tm)
     tl.store(dtot_ptr + c * H + h, tl.sum(adt, axis=0))
@@ -1074,6 +1086,21 @@ def _ssd_pool_tail(
     tl.store(v_pool + slot * s_v + h * P + p, tl.load(X_ptr + ((e - 1) * H + h) * P + p))
 
 
+_ZERO_KV: dict = {}
+
+
+def _zero_kv(nc, R, H, N, P, dev, dtype):
+    """Zero boundary K/V for the TileLang pass (read-only, so cached and grown on demand)."""
+    key = (R, H, N, P, dev, dtype)
+    zk, zv = _ZERO_KV.get(key, (None, None))
+    if zk is None or zk.shape[0] < nc:
+        n = max(nc, 64)
+        zk = torch.zeros(n, R, H, N, device=dev, dtype=dtype)
+        zv = torch.zeros(n, H, P, device=dev, dtype=dtype)
+        _ZERO_KV[key] = (zk, zv)
+    return zk[:nc], zv[:nc]
+
+
 @torch.no_grad()
 def mamba3_mimo_hybrid_pools(
     Q, K, V, Z, angles, DT, ADT, Trap, q_bias, k_bias, psi, phi, zeta, D,
@@ -1081,6 +1108,7 @@ def mamba3_mimo_hybrid_pools(
     pools, slots: torch.Tensor, has_init: torch.Tensor | None, out: torch.Tensor,
     chunk_tokens: int = 128,
     tl_chunk: int = 16,
+    tune: dict | None = None,
 ):
     """:func:`mamba3_mimo_hybrid` reading the entering states from and writing the final states to
     the request pool slots in place (``has_init`` None: every sequence starts from zero)."""
@@ -1116,28 +1144,42 @@ def mamba3_mimo_hybrid_pools(
     SinT = torch.empty(NC, H, P, N, **f32)
     Ain = torch.empty(NC, H, NQ, **f32)
     fin_ang = torch.empty(NS, H, NQ, **f32)
+    tune = tune or {}
+    DA_CS = torch.empty(1, H, T, **f32)
+    DA_CS_REV = torch.empty(1, H, T, **f32)
     _ssd_prep[(NC, H)](angles, DT, ADT, Trap, m_start, m_len, m_send, dacs, ts, gam, thl, dtot, asum, cl_t, sl_t,
-                       T, H, NQ=NQ, LS=chunk_tokens, num_warps=4)
+                       T, H, NQ=NQ, LS=chunk_tokens, dcs16_ptr=DA_CS, dcsr16_ptr=DA_CS_REV, G16=tl_chunk,
+                       num_warps=tune.get("prep_nw", 8))
     _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
                                  R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
-    _ssd_state_pass_pool[(H, NS, P // 16)](
+    pb = tune.get("pass_pb", 16)
+    _ssd_state_pass_pool[(H, NS, P // pb)](
         Sloc, dtot, asum, s_c0, s_nc, s_t0, slots, has_init if has_init is not None else slots,
         angle_pool, ssm_pool, k_pool, v_pool,
         angle_pool.stride(0), ssm_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
-        HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=16, num_warps=2,
+        HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=tune.get("pass_nw", 2),
     )
-    ang_abs = torch.empty(T, H, NQ, **f32)
-    _ssd_abs_angles[(NC, H)](thl, Ain, m_start, m_len, ang_abs, H, NQ=NQ, LS=chunk_tokens, num_warps=4)
-    DA_CS, DA_CS_REV, Segsum = compute_dacs_segsum_triton_varlen(ADT.view(1, H, T), tl_chunk, cu_seqlens=v_cu)
-    zk = torch.zeros(NC, R, H, N, device=dev, dtype=Q.dtype)
-    zv = torch.zeros(NC, H, P, device=dev, dtype=V.dtype)
-    _, _, k_fin = mamba_mimo_forward_varlen(
-        Q.view(1, T, R, 1, N), K.view(1, T, R, 1, N), V.view(1, T, H, P), q_bias, k_bias, psi, phi,
-        Z.view(1, T, H, P), D, zeta, ang_abs.view(1, T, H, NQ), DA_CS, DA_CS_REV, DT.view(1, H, T), Trap.view(1, H, T),
-        Segsum, tl_chunk, 4, Q.dtype, cu_seqlens=v_cu, return_state=True, initial_states=(SinT, zk, zv),
-        threads=128, num_stages=0, out=out.view(1, T, H, P),
-    )
+    zk, zv = _zero_kv(NC, R, H, N, P, dev, Q.dtype)
+    if _TL_V2:
+        # v2: chunk-local phases + per-chunk offset in-kernel, segsum inline, no qk_dot GEMM
+        from .mimo_fwd_varlen_v2 import mamba_mimo_forward_varlen_v2
+        _, _, k_fin = mamba_mimo_forward_varlen_v2(
+            Q.view(1, T, R, 1, N), K.view(1, T, R, 1, N), V.view(1, T, H, P), q_bias, k_bias, psi, phi,
+            Z.view(1, T, H, P), D, zeta, thl.view(1, T, H, NQ), DA_CS, DA_CS_REV, DT.view(1, H, T), Trap.view(1, H, T),
+            Ain, tl_chunk, 4, Q.dtype, cu_seqlens=v_cu, return_state=True, initial_states=(SinT, zk, zv),
+            threads=128, num_stages=0, out=out.view(1, T, H, P),
+        )
+    else:
+        _, _, Segsum = compute_dacs_segsum_triton_varlen(ADT.view(1, H, T), tl_chunk, cu_seqlens=v_cu)
+        ang_abs = torch.empty(T, H, NQ, **f32)
+        _ssd_abs_angles[(NC, H)](thl, Ain, m_start, m_len, ang_abs, H, NQ=NQ, LS=chunk_tokens, num_warps=tune.get("abs_nw", 4))
+        _, _, k_fin = mamba_mimo_forward_varlen(
+            Q.view(1, T, R, 1, N), K.view(1, T, R, 1, N), V.view(1, T, H, P), q_bias, k_bias, psi, phi,
+            Z.view(1, T, H, P), D, zeta, ang_abs.view(1, T, H, NQ), DA_CS, DA_CS_REV, DT.view(1, H, T), Trap.view(1, H, T),
+            Segsum, tl_chunk, 4, Q.dtype, cu_seqlens=v_cu, return_state=True, initial_states=(SinT, zk, zv),
+            threads=128, num_stages=0, out=out.view(1, T, H, P),
+        )
     _ssd_pool_tail[(NS, H)](fin_ang, k_fin, m_lrow, V, m_end, slots, angle_pool, k_pool, v_pool,
                             angle_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
                             H, R=R, N=N, P=P, NQ=NQ, num_warps=1)
