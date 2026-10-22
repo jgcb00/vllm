@@ -29,7 +29,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
@@ -737,7 +737,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
             if self.token_shift:
                 mods = mods + (self.shift_proj_k, self.shift_proj_v)
             self._decode_proj_sizes = [m.weight.shape[0] for m in mods]
-            w = torch.cat([m.weight for m in mods], 0).contiguous()
+            w = cat_rows_shared([m.weight for m in mods])
             self._decode_proj_w = w
         return w
 

@@ -17,11 +17,13 @@ with ``Bk' = (1 + w_norm) * B``, ``Ck = (1 - a) * inv_rms * A / R`` and
 the dense ``2 * 12 * 128`` bf16 per token, the cache keeps two 608-element
 rows per token (``[B (4x128) | C (12x4) | D (12x4)]`` for K and for V):
 2.5x less KV memory and 2.5x less decode-time KV traffic. Decode attention
-runs a dedicated sm_90 kernel over the factors; prefill reconstructs the
-dense K/V of its context and runs FlashAttention varlen.
+runs a dedicated kernel over the factors (sm_90a wgmma on Hopper, mma.sync
+on other sm_80+ GPUs); prefill reconstructs the dense K/V of its context and
+runs FlashAttention varlen.
 
-Rows are stored in plain ``[r][d]`` order; the decode kernel streams them
-with TMA tensor copies (128-byte swizzle) into the canonical wgmma layouts.
+Rows are stored in plain ``[r][d]`` order; the Hopper kernel streams them
+with TMA tensor copies (128-byte swizzle) into the canonical wgmma layouts,
+the sm_80 kernel with cp.async into padded shared-memory rows.
 """
 
 from __future__ import annotations
@@ -53,27 +55,29 @@ HQP = 64  # query heads padded to the kernel's accumulator rows
 ROWP = RANK * HEAD_DIM + 2 * HKV * RANK  # 608 bf16 per plane row
 OFF_C, OFF_D = RANK * HEAD_DIM, RANK * HEAD_DIM + HKV * RANK
 TILE = 13  # tokens per kernel tile; block sizes are multiples of it
-TARGET_CTAS = 400  # ~3 CTAs per SM on GH200
+TARGET_CTAS = 400  # ~3 CTAs per SM on GH200 (Hopper kernel)
 logger = init_logger(__name__)
 
 MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
+SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 
 @lru_cache(maxsize=1)
 def factor_cache_enabled() -> bool:
-    """OLALA_TPA_FACTOR (default on), on Hopper only (the decode kernel is
-    sm_90a wgmma), and only if its JIT build succeeds: otherwise the dense
-    paged KV path is used, with a warning instead of a failed first forward."""
+    """OLALA_TPA_FACTOR (default on), on sm_80+ (sm_90a wgmma kernel on
+    Hopper, mma.sync kernel elsewhere), and only if its JIT build succeeds:
+    otherwise the dense paged KV path is used, with a warning instead of a
+    failed first forward."""
     if os.environ.get("OLALA_TPA_FACTOR", "1") == "0":
         logger.info("Olala: TPA factor cache disabled by OLALA_TPA_FACTOR=0.")
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         warn_slow_path(
             "TPA factor KV cache disabled",
-            f"the decode kernel is sm_90a (Hopper) only; this GPU is sm_{cap}",
+            f"the decode kernels need sm_80+; this GPU is sm_{cap}",
             "dense paged KV cache: 2.5x more KV memory and slower long-context decode (up to -40% throughput at 24k)",
-            "run on H100/H200/GH200 (nothing to fix elsewhere; output is correct)",
+            "run on an Ampere or newer GPU (nothing to fix elsewhere; output is correct)",
         )
         return False
     try:
@@ -485,18 +489,59 @@ def factor_decode_write(
 # --------------------------------------------------------------------------
 
 
+def _hopper() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 @lru_cache(maxsize=1)
 def _load_kernel():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    ext = load_extension(
-        "olala_tpa_factor_decode",
-        "tpa_factor_decode.cu",
-        ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
-        ["-lcuda"],
-    )
+    if _hopper():
+        ext = load_extension(
+            "olala_tpa_factor_decode",
+            "tpa_factor_decode.cu",
+            ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+            ["-lcuda"],
+        )
+    else:
+        major, minor = torch.cuda.get_device_capability()
+        sm = f"{major}{minor}"
+        ext = load_extension(
+            f"olala_tpa_factor_decode_sm{sm}",
+            "tpa_factor_decode_sm80.cu",
+            ["-O3", "-std=c++17", "--use_fast_math", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
+        )
     assert ext.TILE == TILE
     return ext
+
+
+@lru_cache(maxsize=1)
+def _target_ctas() -> int:
+    """Decode CTAs to aim for: TARGET_CTAS on Hopper, else one wave of the sm_80 kernel's resident CTAs
+    (two per SM on sm_86 / sm_89)."""
+    if _hopper():
+        return TARGET_CTAS
+    nsm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return nsm * max(1, int(_load_kernel().occupancy()))
+
+
+def split_table_path() -> str:
+    name = torch.cuda.get_device_name().replace(" ", "_")
+    return os.path.join(SPLIT_TABLE_DIR, f"tpa_factor_splits,device_name={name}.json")
+
+
+@lru_cache(maxsize=1)
+def _split_table() -> list[tuple[int, int]] | None:
+    """Measured best split count per batch size for the sm_80 kernel (blade_attn_bench.py, tune_splits):
+    wave quantization and the merge cost differ too much between GPUs for one formula."""
+    if _hopper() or not os.path.exists(split_table_path()):
+        return None
+    import json
+
+    with open(split_table_path()) as f:
+        table = json.load(f)["splits"]
+    return sorted((int(b), int(n)) for b, n in table.items())
 
 
 @triton.jit
@@ -536,11 +581,19 @@ def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_pt
 
 
 def num_splits_for_batch(batch: int) -> int:
-    """KV splits per request: ~TARGET_CTAS CTAs in total, rounded up to a power
-    of two so the combine kernel has at most 8 specializations (all compiled
-    during cudagraph capture)."""
-    want = max(1, min(128, -(-TARGET_CTAS // max(batch, 1))))
-    return 1 << (want - 1).bit_length()
+    """KV splits per request, a power of two so the combine kernel has at most 8
+    specializations (all compiled during cudagraph capture). Hopper: ~_target_ctas()
+    CTAs, rounded up. sm_80 kernel: the GPU's measured table (entry of the largest
+    tuned batch <= batch), else the largest count that keeps one wave of CTAs."""
+    batch = max(batch, 1)
+    if _hopper():
+        want = max(1, min(128, -(-_target_ctas() // batch)))
+        return 1 << (want - 1).bit_length()
+    table = _split_table()
+    if table:
+        return next((n for b, n in reversed(table) if b <= batch), table[0][1])
+    want = max(1, min(128, _target_ctas() // batch))
+    return 1 << (want.bit_length() - 1)
 
 
 def factor_decode_attention(

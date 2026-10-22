@@ -27,7 +27,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
@@ -416,8 +416,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
-            # Profiling / dry run.
-            out.zero_()
+            self._dry_run_prefill(hidden_states, out)
             return
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
@@ -467,16 +466,20 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         batch 1. Otherwise the two parallel linears.
         """
         if self._in_proj_cat_ok:
-            w = self._in_proj_cat_w
-            if w is None:
-                w = torch.cat([self.in_proj.weight, self.in_proj_dyn.weight], 0).contiguous()
-                self._in_proj_cat_w = w
+            w = self._in_proj_cat_weight()
             out = decode_gemv(u, w) if u.shape[0] == 1 else F.linear(u, w)
             n1 = self.in_proj.weight.shape[0]
             return out[:, :n1], out[:, n1:]
         zxdt, _ = self.in_proj(u)
         bc, _ = self.in_proj_dyn(u)
         return zxdt, bc
+
+    def _in_proj_cat_weight(self) -> torch.Tensor:
+        if self._in_proj_cat_w is None:
+            self._in_proj_cat_w = cat_rows_shared(
+                [self.in_proj.weight, self.in_proj_dyn.weight]
+            )
+        return self._in_proj_cat_w
 
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
@@ -537,6 +540,27 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             qsl_cpu=md.query_start_loc_p_cpu,
         )
 
+    def _dry_run_prefill(self, h: torch.Tensor, out: torch.Tensor) -> None:
+        """Profiling / dry run: the real prefill over the batch as one sequence,
+        on scratch one-slot pools. The memory profiler then sees the prefill
+        activation peak (sizing the KV cache from a zeroed output left too
+        little headroom on 20 GB GPUs), and the TileLang / Triton JIT and
+        autotuning run before the KV cache is allocated."""
+        if self._in_proj_cat_ok:
+            self._in_proj_cat_weight()  # decode-time weight cache, before KV sizing
+        n = h.shape[0]
+        if n == 0 or torch.cuda.is_current_stream_capturing():
+            out.zero_()
+            return
+        pools = tuple(
+            torch.zeros((1, *shape), dtype=dtype, device=h.device)
+            for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
+        )
+        slots = torch.zeros(1, dtype=torch.long, device=h.device)
+        qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
+        self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
+
+    @staticmethod
     def _gather_init_states(
         pools: tuple[torch.Tensor, ...],
         slots: torch.Tensor,
@@ -714,6 +738,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 ):
                     dst.copy_(src)
             refresh_f32_cache()
+            # Normally a self-copy (cat_rows_shared): only matters if a reload
+            # rebound param.data instead of copying into it.
             w = self._in_proj_cat_w
             if w is not None:
                 n1 = self.in_proj.weight.shape[0]

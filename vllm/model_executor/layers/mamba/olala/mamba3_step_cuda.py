@@ -30,18 +30,19 @@ _ENV = "OLALA_MAMBA3_STEP"
 
 @lru_cache(maxsize=1)
 def cuda_step_enabled() -> bool:
-    """OLALA_MAMBA3_STEP=cuda (default), on Hopper only (sm_90 SASS), and only
-    if the JIT build succeeds; otherwise the CuteDSL step is used."""
+    """OLALA_MAMBA3_STEP=cuda (default), on sm_80+ (the kernel only needs
+    cp.async / ldmatrix / mma.sync; it is built for the running GPU's arch),
+    and only if the JIT build succeeds; otherwise the CuteDSL step is used."""
     if os.environ.get(_ENV, "cuda") != "cuda":
         logger.info("Olala: CUDA Mamba-3 step disabled by %s.", _ENV)
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         warn_slow_path(
             "CUDA Mamba-3 decode step disabled",
-            f"the kernel is built for sm_90 (Hopper) only; this GPU is sm_{cap}",
+            f"the kernel needs sm_80+ (mma.sync bf16); this GPU is sm_{cap}",
             "CuteDSL decode step: ~1.4x slower Mamba-3 decode step (-10 to -15% decode throughput)",
-            "run on H100/H200/GH200 (nothing to fix elsewhere; output is correct)",
+            "run on an Ampere or newer GPU (nothing to fix elsewhere; output is correct)",
         )
         return False
     try:
@@ -62,10 +63,15 @@ def cuda_step_enabled() -> bool:
 def _load():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
+    major, minor = torch.cuda.get_device_capability()
+    sm = f"{major}{minor}"
+    # One build per arch: the build directory is shared (e.g. a cache volume
+    # mounted on H100 and A4500 nodes alike); sm_90 keeps its historical name.
+    name = "olala_mamba3_step" if sm == "90" else f"olala_mamba3_step_sm{sm}"
     return load_extension(
-        "olala_mamba3_step",
+        name,
         "mamba3_step.cu",
-        ["-O3", "-std=c++17", "-gencode=arch=compute_90,code=sm_90"],
+        ["-O3", "-std=c++17", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
     )
 
 
