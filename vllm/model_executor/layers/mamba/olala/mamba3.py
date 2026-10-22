@@ -230,6 +230,64 @@ def _decode_preamble_bc_kernel(
         tl.store(bn_cn_ptr + q * S + offs_s, (vals * inv * wsel).to(bn_cn_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _prefill_prologue_kernel(
+    zxdt_ptr, stride_zxdt, bc_ptr, stride_bc,
+    x_ptr, z_ptr,  # out (T, H, D) contiguous
+    dt_ptr, adt_ptr, trap_ptr,  # out (H, T): fp32 softplus(dt + dt_bias), fp32 A*DT, raw trap
+    q_ptr, k_ptr,  # out (T, R, S): C_norm(C), B_norm(B)
+    ang_ptr,  # out (T, NA) fp32
+    dt_bias_ptr, a_floor, wb_ptr, wc_ptr, eps,
+    T, H, R, n_pre,
+    D: tl.constexpr, S: tl.constexpr, NA: tl.constexpr, BT: tl.constexpr, ZERO_CENTERED: tl.constexpr,
+):
+    """Prefill counterpart of _decode_preamble_bc_kernel, in one launch: programs [0, n_pre) handle a
+    (BT-token tile, head) of the in_proj output (z/x copies and the dt / A / trap chain, written
+    head-major), the others one (token, B or C, mimo row) RMS norm; row j == 0 also copies the
+    rotary angles."""
+    pid = tl.program_id(0)
+    if pid < n_pre:
+        h = pid % H
+        t = (pid // H) * BT + tl.arange(0, BT)
+        tm = t < T
+        d = tl.arange(0, D)
+        zrow = zxdt_ptr + t[:, None].to(tl.int64) * stride_zxdt + h * (2 * D + 3)
+        tl.store(z_ptr + (t[:, None].to(tl.int64) * H + h) * D + d[None, :], tl.load(zrow + d[None, :], mask=tm[:, None]), mask=tm[:, None])
+        tl.store(x_ptr + (t[:, None].to(tl.int64) * H + h) * D + d[None, :], tl.load(zrow + D + d[None, :], mask=tm[:, None]), mask=tm[:, None])
+        b1 = zxdt_ptr + t.to(tl.int64) * stride_zxdt + h * (2 * D + 3) + 2 * D
+        dt = tl.load(b1, mask=tm, other=0.0).to(tl.float32)
+        a = tl.load(b1 + 1, mask=tm, other=0.0).to(tl.float32)
+        trap = tl.load(b1 + 2, mask=tm, other=0.0)
+        sp_a = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        v = dt + tl.load(dt_bias_ptr + h).to(tl.float32)
+        sp_dt = tl.where(v > 20.0, v, tl.log(1.0 + tl.exp(v)))
+        tl.store(dt_ptr + h * T + t, sp_dt, mask=tm)
+        tl.store(adt_ptr + h * T + t, tl.minimum(-sp_a, -a_floor) * sp_dt, mask=tm)
+        tl.store(trap_ptr + h * T + t, trap, mask=tm)
+    else:
+        q = pid - n_pre
+        j = q % (2 * R)
+        tok = q // (2 * R)
+        r = j % R
+        is_c = j >= R
+        bcrow = bc_ptr + tok.to(tl.int64) * stride_bc + r * S + is_c.to(tl.int32) * (R * S)
+        offs = tl.arange(0, S)
+        vals = tl.load(bcrow + offs).to(tl.float32)
+        inv = 1.0 / tl.sqrt(tl.sum(vals * vals) / S + eps)
+        # same roundings as OlalaRMSNorm: rms_norm output in the activation dtype, gain (1 + w)
+        # in the parameter dtype, product rounded once more
+        w = tl.where(is_c, tl.load(wc_ptr + offs), tl.load(wb_ptr + offs))
+        if ZERO_CENTERED:
+            w = (w.to(tl.float32) + 1.0).to(wb_ptr.dtype.element_ty)
+        y = ((vals * inv).to(q_ptr.dtype.element_ty).to(tl.float32) * w.to(tl.float32)).to(q_ptr.dtype.element_ty)
+        dst = tl.where(is_c, q_ptr, k_ptr) + (tok.to(tl.int64) * R + r) * S + offs
+        tl.store(dst, y)
+        if j == 0:
+            na = tl.arange(0, NA)
+            tl.store(ang_ptr + tok.to(tl.int64) * NA + na,
+                     tl.load(bc_ptr + tok.to(tl.int64) * stride_bc + 2 * R * S + na).to(tl.float32))
+
+
 class OlalaMamba3Mixer(PluggableLayer, MambaBase):
     """Mamba3 MIMO mixer over vLLM's paged recurrent state.
 
@@ -353,6 +411,15 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self._decode_const_w: tuple[torch.Tensor, ...] | None = None
 
         self._postgate_norm = getattr(config, "mamba3_postgate_norm", False)
+        pow2 = lambda n: n > 0 and (n & (n - 1)) == 0  # noqa: E731
+        self._hybrid_ok = (
+            self.ngroups == 1
+            and self.in_proj.bias is None
+            and self.in_proj_dyn.bias is None
+            and pow2(self.headdim)
+            and pow2(self.d_state)
+            and self.num_rope_angles == self.d_state // self.rotary_dim_divisor
+        )
         if self._postgate_norm:
             # Per-rank local-shard norm: each rank normalizes only its own
             # d_inner slice, which differs numerically from a global RMSNorm
@@ -607,11 +674,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         init_states: tuple[torch.Tensor, ...] | None = None,
         qsl_cpu: torch.Tensor | None = None,
     ) -> None:
+        if _mamba3_mimo_hybrid is not None and self._hybrid_ok:
+            self._prefill_hybrid(h, out, slots, qsl, pools, init_states, qsl_cpu)
+            return
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
-        if _mamba3_mimo_hybrid is not None:
-            self._prefill_hybrid(z, x, dt, A, trap, B, C, angle, out, slots, qsl, pools, init_states, qsl_cpu)
-            return
         z = z.unsqueeze(0)  # (1, T, H, p)
         x = x.unsqueeze(0)  # (1, T, H, p)
         dt = dt.unsqueeze(0).to(torch.float32)  # (1, T, H)
@@ -700,16 +767,29 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             y = self.output_norm(y)
         out.copy_(y.to(out.dtype))
 
-    def _prefill_hybrid(self, z, x, dt, A, trap, B, C, angle, out, slots, qsl, pools, init_states, qsl_cpu):
+    def _prefill_hybrid(self, h, out, slots, qsl, pools, init_states, qsl_cpu):
         angle_pool, ssm_pool, k_pool, v_pool = pools
-        T = x.shape[0]
-        B = self.B_norm(B.unsqueeze(0))  # (1, T, R, G, N)
-        C = self.C_norm(C.unsqueeze(0))
-        _A = torch.clamp(-F.softplus(A.to(torch.float32)), max=-self.A_floor)  # (T, H)
-        DT = F.softplus(dt.to(torch.float32) + self.dt_bias)
-        ADT = (_A * DT).t().contiguous()  # (H, T)
-        DT = DT.t().contiguous()
-        trap = trap.t().contiguous()
+        T = h.shape[0]
+        H, D, R, S = self.nheads_local, self.headdim, self.mimo_dim, self.d_state
+        zxdt, _ = self.in_proj(h)
+        bc, _ = self.in_proj_dyn(h)
+        dev, dt_ = h.device, zxdt.dtype
+        x = torch.empty(T, H, D, device=dev, dtype=dt_)
+        z = torch.empty(T, H, D, device=dev, dtype=dt_)
+        DT = torch.empty(H, T, device=dev, dtype=torch.float32)
+        ADT = torch.empty(H, T, device=dev, dtype=torch.float32)
+        trap = torch.empty(H, T, device=dev, dtype=dt_)
+        Q = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
+        K = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
+        ang = torch.empty(T, self.num_rope_angles, device=dev, dtype=torch.float32)
+        BT = 16
+        n_pre = triton.cdiv(T, BT) * H
+        _prefill_prologue_kernel[(n_pre + T * 2 * R,)](
+            zxdt, zxdt.stride(0), bc, bc.stride(0), x, z, DT, ADT, trap, Q, K, ang,
+            self.dt_bias, self.A_floor, self.B_norm.norm.weight, self.C_norm.norm.weight, self.B_norm.norm.eps,
+            T, H, R, n_pre, D=D, S=S, NA=self.num_rope_angles, BT=BT,
+            ZERO_CENTERED=self.B_norm.norm.zero_centered, num_warps=4,
+        )
         cw = self._prefill_const_w
         if cw is None:
             cw = (
@@ -725,20 +805,20 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if qsl_cpu is None:
             qsl_cpu = qsl.cpu()
         cu = [int(v) for v in qsl_cpu.tolist()]
+        direct = not self._postgate_norm and out.dtype == x.dtype and out.is_contiguous()
         Out, Final_Angle, Final_SSM, Final_K = _mamba3_mimo_hybrid(
-            C.reshape(T, self.mimo_dim, self.d_state).contiguous().bfloat16(),
-            B.reshape(T, self.mimo_dim, self.d_state).contiguous().bfloat16(),
-            x.contiguous().bfloat16(), z.contiguous(), angle.to(torch.float32), DT, ADT, trap,
-            q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu, init_states=init_states,
+            Q, K, x, z, ang, DT, ADT, trap, q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu,
+            init_states=init_states, out=out.view(T, H, D) if direct else None,
         )
         angle_pool[slots] = Final_Angle.to(angle_pool.dtype)
         ssm_pool[slots] = Final_SSM.to(ssm_pool.dtype)
         k_pool[slots] = Final_K.to(k_pool.dtype)
         v_pool[slots] = x[qsl[1:].long() - 1].to(v_pool.dtype)
-        y = Out.reshape(T, -1)
-        if self._postgate_norm:
-            y = self.output_norm(y)
-        out.copy_(y.to(out.dtype))
+        if not direct:
+            y = Out.reshape(T, -1)
+            if self._postgate_norm:
+                y = self.output_norm(y)
+            out.copy_(y.to(out.dtype))
 
     # -- Decode -------------------------------------------------------------
     def refresh_weight_caches(self) -> None:

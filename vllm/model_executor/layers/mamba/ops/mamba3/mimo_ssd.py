@@ -705,6 +705,7 @@ def mamba3_mimo_hybrid(
     tl_chunk: int = 16,
     tl_threads: int = 128,
     tl_stages: int = 0,
+    out: torch.Tensor | None = None,
 ):
     """Chunk-parallel exact prefill: the Triton phases give every LS-token chunk its entering state
     and absolute phases, then the TileLang chunked-scan kernel runs once over the chunks as
@@ -757,6 +758,7 @@ def mamba3_mimo_hybrid(
         Z.view(1, T, H, P), D, zeta, ang_abs.view(1, T, H, NQ), DA_CS, DA_CS_REV, DT.view(1, H, T), Trap.view(1, H, T),
         Segsum, tl_chunk, 4, Q.dtype, cu_seqlens=v_cu, return_state=True, initial_states=(SinT, zk, zv),
         threads=tl_threads, num_stages=tl_stages,
+        out=out.view(1, T, H, P) if out is not None else None,
     )
     last_rows = torch.tensor([seq_c0[s] + seq_nc[s] - 1 for s in range(NS)], dtype=torch.long).to(dev, non_blocking=True)
     return o.view(T, H, P), fin_ang, fin_ssm, k_fin[last_rows]
