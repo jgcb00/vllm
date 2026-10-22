@@ -639,11 +639,21 @@ class OlalaDiffTPAAttention(PluggableLayer):
         v = torch.bmm(A_v, B_v).div_(R)
 
         # Previous-token seeds: in-batch predecessor, or the pool (or zero) at a request start.
-        qsl_t = torch.tensor(qsl, dtype=torch.int64, device=dev)
-        nonempty = qsl_t[1:] > qsl_t[:-1]
-        starts, ends = qsl_t[:-1][nonempty], qsl_t[1:][nonempty]
-        pslots_t = torch.tensor([int(x) for x in pslots], dtype=torch.int64, device=dev)[nonempty]
-        init_t = torch.tensor([bool(x) for x in has_init], dtype=torch.bool, device=dev)[nonempty]
+        # host-side filtering and one async upload (device boolean indexing / torch.tensor(device=)
+        # would each synchronize the stream)
+        keep = [r for r in range(nreq) if qsl[r + 1] > qsl[r]]
+        lengths = [int(x) for x in seq_lens_cpu]
+        cu_k = [0]
+        for L in lengths:
+            cu_k.append(cu_k[-1] + L)
+        nk = len(keep)
+        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + [int(pslots[r]) for r in keep]
+                            + [int(bool(has_init[r])) for r in keep] + [int(x) for x in qsl] + cu_k,
+                            dtype=torch.int64).to(dev, non_blocking=True)
+        starts, ends, pslots_t = meta[:nk], meta[nk:2 * nk], meta[2 * nk:3 * nk]
+        init_t = meta[3 * nk:4 * nk].bool()
+        cu_q_dev = meta[4 * nk:4 * nk + nreq + 1].to(torch.int32)
+        cu_k_dev = meta[4 * nk + nreq + 1:].to(torch.int32)
         k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
 
         def seeded(cur: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
@@ -671,22 +681,18 @@ class OlalaDiffTPAAttention(PluggableLayer):
         write_rows(vplane, slots, factor_rows(A_v, av_prev, B_v, a_v, None, None))
 
         q = self._q_for_attention(q_all, positions)
-        lengths = [int(x) for x in seq_lens_cpu]
         bt_rows = md.block_table[bt0 : bt0 + nreq]
         if os.environ.get("OLALA_TPA_RECON_TORCH") == "1":  # reference path (A/B checks)
             k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
             v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
         else:
             k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
-        cu_k = [0]
-        for L in lengths:
-            cu_k.append(cu_k[-1] + L)
         out = flash_attn_varlen_func(
             q=q, k=k_all, v=v_all,
             max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
-            cu_seqlens_q=torch.tensor(qsl, dtype=torch.int32, device=dev),
+            cu_seqlens_q=cu_q_dev,
             max_seqlen_k=max(lengths),
-            cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
+            cu_seqlens_k=cu_k_dev,
             softmax_scale=self.scale, causal=True, softcap=self.softcap,
             fa_version=get_flash_attn_version(),
         )

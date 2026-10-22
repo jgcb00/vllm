@@ -86,6 +86,9 @@ def _is_pow2(n: int) -> bool:
 
 def _lazy_import_kernels() -> None:
     global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid
+    if os.environ.get("OLALA_SYNC_DEBUG") == "1" and not getattr(torch, "_olala_sync_dbg", False):  # debug: report host syncs (warn)
+        torch._olala_sync_dbg = True
+        torch.cuda.set_sync_debug_mode("warn")
     global _apply_rotary_qk_inference_fwd
     if _mamba3_mimo is not None:
         return

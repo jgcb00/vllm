@@ -319,15 +319,28 @@ def factor_rows(
     return torch.cat([swizzle_b(Bp).reshape(n, RANK * HEAD_DIM), C.reshape(n, -1), Dc.reshape(n, -1)], dim=1)
 
 
+@triton.jit
+def _write_rows_kernel(plane_ptr, slots_ptr, rows_ptr, bstride, block_size, W: tl.constexpr, BW: tl.constexpr):
+    i = tl.program_id(0)
+    slot = tl.load(slots_ptr + i).to(tl.int64)
+    if slot < 0:
+        return
+    c = tl.arange(0, BW)
+    v = tl.load(rows_ptr + i.to(tl.int64) * W + c, mask=c < W)
+    tl.store(plane_ptr + (slot // block_size) * bstride + (slot % block_size) * W + c,
+             v.to(plane_ptr.dtype.element_ty), mask=c < W)
+
+
 def write_rows(plane: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
-    """Scatter rows into a (num_blocks, block_size, ROWP) plane (any block stride); slots < 0 are skipped."""
-    valid = slots >= 0
-    if not bool(valid.all()):
-        slots = slots[valid]
-        rows = rows[valid]
-    bs = plane.shape[1]
-    slots = slots.long()
-    plane[slots // bs, slots % bs] = rows.to(plane.dtype)
+    """Scatter rows into a (num_blocks, block_size, ROWP) plane (any block stride); slots < 0 are
+    skipped on the device (no host sync)."""
+    n = rows.shape[0]
+    if n == 0:
+        return
+    assert plane.stride(1) == ROWP and plane.stride(2) == 1
+    rows = rows.contiguous()
+    _write_rows_kernel[(n,)](plane, slots, rows, plane.stride(0), plane.shape[1],
+                             W=ROWP, BW=triton.next_power_of_2(ROWP), num_warps=4)
 
 
 def reconstruct_dense(plane: torch.Tensor, blocks: torch.Tensor, length: int) -> torch.Tensor:
