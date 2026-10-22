@@ -188,14 +188,15 @@ def _ssd_state_pass(
     Sin_ptr, Ain_ptr, fin_ssm_ptr, fin_ang_ptr,
     T, H,
     HAS_INIT: tl.constexpr, R: tl.constexpr, N: tl.constexpr, P: tl.constexpr, NQ: tl.constexpr,
-    SIN_T: tl.constexpr = False,
+    SIN_T: tl.constexpr = False, PB: tl.constexpr = 64,
 ):
     h = tl.program_id(0)
     s = tl.program_id(1)
+    p0 = tl.program_id(2) * PB
     c0 = tl.load(seq_c0_ptr + s)
     nc = tl.load(seq_nc_ptr + s)
     nq = tl.arange(0, NQ)
-    p = tl.arange(0, P)
+    p = p0 + tl.arange(0, PB)
     if HAS_INIT:
         # INIT_SSM is (NS, H, P, N); fold the previous chunk's last token with weight DT[t0] sigmoid(-Trap[t0])
         ib = in_ssm_ptr + (s * H + h).to(tl.int64) * P * N
@@ -216,10 +217,10 @@ def _ssd_state_pass(
             st3 += tl.load(kb + 3 * NQ + nq).to(tl.float32)[:, None] * pv[None, :]
         th = tl.load(in_ang_ptr + (s * H + h) * NQ + nq)
     else:
-        st0 = tl.zeros([NQ, P], dtype=tl.float32)
-        st1 = tl.zeros([NQ, P], dtype=tl.float32)
-        st2 = tl.zeros([NQ, P], dtype=tl.float32)
-        st3 = tl.zeros([NQ, P], dtype=tl.float32)
+        st0 = tl.zeros([NQ, PB], dtype=tl.float32)
+        st1 = tl.zeros([NQ, PB], dtype=tl.float32)
+        st2 = tl.zeros([NQ, PB], dtype=tl.float32)
+        st3 = tl.zeros([NQ, PB], dtype=tl.float32)
         th = tl.zeros([NQ], dtype=tl.float32)
     for j in range(0, nc):
         c = c0 + j
@@ -742,9 +743,9 @@ def mamba3_mimo_hybrid(
         in_ang, in_ssm = in_ang.float(), in_ssm.float()
     else:
         in_ang = in_ssm = in_k = in_v = Sloc  # unused
-    _ssd_state_pass[(H, NS)](
+    _ssd_state_pass[(H, NS, P // 16)](
         Sloc, dtot, asum, smeta[0], smeta[1], smeta[2], in_ssm, in_k, in_v, in_ang, psi, DT, Trap,
-        SinT, Ain, fin_ssm, fin_ang, T, H, HAS_INIT=has_init, R=R, N=N, P=P, NQ=NQ, SIN_T=True, num_warps=4,
+        SinT, Ain, fin_ssm, fin_ang, T, H, HAS_INIT=has_init, R=R, N=N, P=P, NQ=NQ, SIN_T=True, PB=16, num_warps=2,
     )
     ang_abs = torch.empty(T, H, NQ, **f32)
     _ssd_abs_angles[(NC, H)](thl, Ain, meta[0], meta[1], ang_abs, H, NQ=NQ, LS=chunk_tokens, num_warps=4)

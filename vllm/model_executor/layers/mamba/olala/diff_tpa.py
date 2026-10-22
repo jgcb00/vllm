@@ -418,7 +418,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
-            allp = decode_gemv(hidden_states, w_all) if n == 1 else F.linear(hidden_states, w_all)
+            if n == 1:
+                allp = decode_gemv(hidden_states, w_all)
+            else:
+                allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
             q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
             shift_alphas = tuple(parts[6:]) if self.token_shift else None
@@ -747,7 +750,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             if self.token_shift:
                 mods = mods + (self.shift_proj_k, self.shift_proj_v)
             self._decode_proj_sizes = [m.weight.shape[0] for m in mods]
-            w = cat_rows_shared([m.weight for m in mods])
+            n = sum(self._decode_proj_sizes)
+            w = cat_rows_shared([m.weight for m in mods], pad_to=128)
+            self._decode_proj_w_padded = w  # prefill GEMM: aligned width (Hopper cuBLAS kernels)
+            w = w[:n]
             self._decode_proj_w = w
         return w
 
