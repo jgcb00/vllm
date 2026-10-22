@@ -912,11 +912,11 @@ def _olala_prefill_cudagraph_sizes(vllm_config: "VllmConfig") -> None:
         return
     if cc.max_cudagraph_capture_size is not None or cc.cudagraph_capture_sizes is not None:
         return
-    budget = min(int(sc.max_num_batched_tokens), 4096)
+    budget = min(int(sc.max_num_batched_tokens), int(os.environ.get("OLALA_PREFILL_GRAPHS_MAX", "4096")))
     if budget <= 512:
         return
     sizes = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
-    sizes += [n for n in (640, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096) if n < budget]
+    sizes += [n for n in (640, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192) if n < budget]
     sizes.append(budget)
     cc.cudagraph_capture_sizes = sorted(set(sizes))
     cc.max_cudagraph_capture_size = budget

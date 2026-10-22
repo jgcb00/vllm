@@ -33,6 +33,22 @@ from vllm.triton_utils import tl, triton
 import os as _os
 
 _TL_V2 = _os.environ.get("OLALA_TL_V2", "1") == "1"
+_SCAN_CUDA = _os.environ.get("OLALA_SCAN_CUDA", "1") == "1"  # sm_90 only (wgmma); TileLang elsewhere
+_SCAN_EXT = None
+
+
+def _scan_cuda_ok(dev) -> bool:
+    return _SCAN_CUDA and torch.cuda.get_device_capability(dev) == (9, 0)
+
+
+def _scan_ext():
+    """CUDA output pass of the hybrid scan (olala/csrc/mamba3_scan_prefill.cu), built JIT."""
+    global _SCAN_EXT
+    if _SCAN_EXT is None:
+        from vllm.model_executor.layers.mamba.olala.jit import load_extension
+        _SCAN_EXT = load_extension("olala_mamba3_scan_prefill", "mamba3_scan_prefill.cu",
+                                   ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"])
+    return _SCAN_EXT
 
 
 @triton.jit
@@ -1182,8 +1198,12 @@ def mamba3_mimo_hybrid_pools(
         psi, DT, Trap, SinT, Ain, fin_ang, T, H,
         HAS_INIT=has_init is not None, R=R, N=N, P=P, NQ=NQ, PB=pb, num_warps=tune.get("pass_nw", 2),
     )
-    zk, zv = _zero_kv(NC, R, H, N, P, dev, Q.dtype)
-    if _TL_V2:
+    if _scan_cuda_ok(dev):
+        k_fin = torch.empty(NC, R, H, N, device=dev, dtype=Q.dtype)
+        _scan_ext().scan(Q, K, V, Z, q_bias, k_bias, psi, phi, zeta, D, thl, Ain, DA_CS, DA_CS_REV, ts, gam,
+                         m_start, m_len, m_last, SinT, out, k_fin, NC)
+    elif _TL_V2:
+        zk, zv = _zero_kv(NC, R, H, N, P, dev, Q.dtype)
         # v2: chunk-local phases + per-chunk offset in-kernel, segsum inline, no qk_dot GEMM
         from .mimo_fwd_varlen_v2 import mamba_mimo_forward_varlen_v2
         _, _, k_fin = mamba_mimo_forward_varlen_v2(
@@ -1193,6 +1213,7 @@ def mamba3_mimo_hybrid_pools(
             threads=128, num_stages=0, out=out.view(1, T, H, P),
         )
     else:
+        zk, zv = _zero_kv(NC, R, H, N, P, dev, Q.dtype)
         _, _, Segsum = compute_dacs_segsum_triton_varlen(ADT.view(1, H, T), tl_chunk, cu_seqlens=v_cu)
         ang_abs = torch.empty(T, H, NQ, **f32)
         _ssd_abs_angles[(NC, H)](thl, Ain, m_start, m_len, ang_abs, H, NQ=NQ, LS=chunk_tokens, num_warps=tune.get("abs_nw", 4))
