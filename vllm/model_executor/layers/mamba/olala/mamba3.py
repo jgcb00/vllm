@@ -76,6 +76,7 @@ _FUSE_ROTARY_MAX_BATCH = 64
 _mamba3_mimo = None
 _mamba3_mimo_grouped = None
 _mamba3_mimo_hybrid = None
+_mamba3_mimo_hybrid_pools = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
 
@@ -85,7 +86,7 @@ def _is_pow2(n: int) -> bool:
 
 
 def _lazy_import_kernels() -> None:
-    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid
+    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid, _mamba3_mimo_hybrid_pools
     if os.environ.get("OLALA_SYNC_DEBUG") == "1" and not getattr(torch, "_olala_sync_dbg", False):  # debug: report host syncs (warn)
         torch._olala_sync_dbg = True
         torch.cuda.set_sync_debug_mode("warn")
@@ -115,9 +116,13 @@ def _lazy_import_kernels() -> None:
     # 128-token chunks): every chunk of every sequence runs in parallel. OLALA_M3_PREFILL=tilelang
     # restores the serial-per-sequence path.
     if os.environ.get("OLALA_M3_PREFILL", "hybrid") == "hybrid":
-        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import mamba3_mimo_hybrid
+        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import (
+            mamba3_mimo_hybrid,
+            mamba3_mimo_hybrid_pools,
+        )
 
         _mamba3_mimo_hybrid = mamba3_mimo_hybrid
+        _mamba3_mimo_hybrid_pools = mamba3_mimo_hybrid_pools
 
 
 @triton.jit
@@ -599,6 +604,14 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         md: Mamba3AttentionMetadata,
         pools: tuple[torch.Tensor, ...],
     ) -> None:
+        if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok:
+            # pool slots read / written in place by the kernels (no host sync, no gathers)
+            self._prefill_hybrid(
+                h, out, slots, md.query_start_loc_p, pools,
+                md.has_initial_state if md.has_initial_any else None,
+                md.query_start_loc_p_cpu,
+            )
+            return
         # Fast path: every prompt starts from zero state, so one packed varlen
         # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
@@ -674,8 +687,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         init_states: tuple[torch.Tensor, ...] | None = None,
         qsl_cpu: torch.Tensor | None = None,
     ) -> None:
-        if _mamba3_mimo_hybrid is not None and self._hybrid_ok:
-            self._prefill_hybrid(h, out, slots, qsl, pools, init_states, qsl_cpu)
+        if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok and init_states is None:
+            self._prefill_hybrid(h, out, slots, qsl, pools, None, qsl_cpu)
             return
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
@@ -767,7 +780,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             y = self.output_norm(y)
         out.copy_(y.to(out.dtype))
 
-    def _prefill_hybrid(self, h, out, slots, qsl, pools, init_states, qsl_cpu):
+    def _prefill_hybrid(self, h, out, slots, qsl, pools, has_init, qsl_cpu):
         angle_pool, ssm_pool, k_pool, v_pool = pools
         T = h.shape[0]
         H, D, R, S = self.nheads_local, self.headdim, self.mimo_dim, self.d_state
@@ -805,17 +818,17 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         if qsl_cpu is None:
             qsl_cpu = qsl.cpu()
         cu = [int(v) for v in qsl_cpu.tolist()]
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        assert (ssm_pool.stride()[1:] == (D * S, S, 1) and k_pool.stride()[1:] == (H * S, S, 1)
+                and v_pool.stride()[1:] == (D, 1) and angle_pool.stride()[1:] == (self.num_rope_angles, 1))
         direct = not self._postgate_norm and out.dtype == x.dtype and out.is_contiguous()
-        Out, Final_Angle, Final_SSM, Final_K = _mamba3_mimo_hybrid(
+        o_buf = out.view(T, H, D) if direct else torch.empty(T, H, D, device=dev, dtype=x.dtype)
+        _mamba3_mimo_hybrid_pools(
             Q, K, x, z, ang, DT, ADT, trap, q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu,
-            init_states=init_states, out=out.view(T, H, D) if direct else None,
+            pools, slots, has_init, o_buf,
         )
-        angle_pool[slots] = Final_Angle.to(angle_pool.dtype)
-        ssm_pool[slots] = Final_SSM.to(ssm_pool.dtype)
-        k_pool[slots] = Final_K.to(k_pool.dtype)
-        v_pool[slots] = x[qsl[1:].long() - 1].to(v_pool.dtype)
         if not direct:
-            y = Out.reshape(T, -1)
+            y = o_buf.reshape(T, -1)
             if self._postgate_norm:
                 y = self.output_norm(y)
             out.copy_(y.to(out.dtype))
