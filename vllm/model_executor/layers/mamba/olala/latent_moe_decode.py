@@ -16,6 +16,8 @@ token count then happens inside the op, where torch.compile cannot
 specialize it away.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -31,7 +33,7 @@ from vllm.utils.torch_utils import (
 SMALL_BATCH_MAX_TOKENS = 8
 # Above this many tokens the concatenated-projection path costs more in
 # activation traffic than it saves in launches (measured on 24k prefills).
-FUSED_PROJ_MAX_TOKENS = 512
+FUSED_PROJ_MAX_TOKENS = int(os.environ.get("OLALA_FUSED_PROJ_MAX_TOKENS", "512"))
 
 
 @triton.jit

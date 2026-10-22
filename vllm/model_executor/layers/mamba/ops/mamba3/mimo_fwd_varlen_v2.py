@@ -34,6 +34,8 @@ Copyright (c) 2026, Dao AI Lab, Goombalab
 """
 
 
+import os as _os
+
 import tilelang
 import tilelang.language as T
 import torch
@@ -52,6 +54,7 @@ import torch
 # )
 @tilelang.jit(
     out_idx=[],
+    compile_flags=([f"--maxrregcount={_os.environ['OLALA_TL_MAXREG']}"] if _os.environ.get("OLALA_TL_MAXREG") else None),
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,

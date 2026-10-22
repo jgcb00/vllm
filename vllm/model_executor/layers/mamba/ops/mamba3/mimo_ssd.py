@@ -1150,8 +1150,12 @@ def mamba3_mimo_hybrid_pools(
     _ssd_prep[(NC, H)](angles, DT, ADT, Trap, m_start, m_len, m_send, dacs, ts, gam, thl, dtot, asum, cl_t, sl_t,
                        T, H, NQ=NQ, LS=chunk_tokens, dcs16_ptr=DA_CS, dcsr16_ptr=DA_CS_REV, G16=tl_chunk,
                        num_warps=tune.get("prep_nw", 8))
-    _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
-                                 R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
+    if tune.get("cs_half", False):
+        _ssd_chunk_state_half[(NC, H, 2)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
+                                          R=R, N=N, P=P, NQ=NQ, LB=tune.get("cs_lb", 16), num_warps=tune.get("cs_nw", 4))
+    else:
+        _ssd_chunk_state[(NC, H, 1)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
+                                     R=R, N=N, P=P, NQ=NQ, LB=16, PB=P, num_warps=8)
     pb = tune.get("pass_pb", 16)
     _ssd_state_pass_pool[(H, NS, P // pb)](
         Sloc, dtot, asum, s_c0, s_nc, s_t0, slots, has_init if has_init is not None else slots,
@@ -1183,6 +1187,56 @@ def mamba3_mimo_hybrid_pools(
     _ssd_pool_tail[(NS, H)](fin_ang, k_fin, m_lrow, V, m_end, slots, angle_pool, k_pool, v_pool,
                             angle_pool.stride(0), k_pool.stride(0), v_pool.stride(0),
                             H, R=R, N=N, P=P, NQ=NQ, num_warps=1)
+
+
+@triton.jit
+def _ssd_chunk_state_half(
+    K_ptr, V_ptr, kb_ptr, psi_ptr, cl_ptr, sl_ptr, dacs_ptr, ts_ptr, dtot_ptr,
+    ch_start_ptr, ch_len_ptr, Sloc_ptr,
+    T, H,
+    R: tl.constexpr, N: tl.constexpr, P: tl.constexpr, NQ: tl.constexpr, LB: tl.constexpr,
+):
+    """_ssd_chunk_state split over its column groups: program_id(2) == 0 accumulates the rotated pair
+    (groups 0 and 2), == 1 the unrotated groups 1 and 3 (half the accumulators per program)."""
+    c = tl.program_id(0)
+    h = tl.program_id(1)
+    half = tl.program_id(2)
+    cs = tl.load(ch_start_ptr + c)
+    cl = tl.load(ch_len_ptr + c)
+    dlast = tl.load(dtot_ptr + c * H + h)
+    LBR: tl.constexpr = LB * R
+    m = tl.arange(0, LBR)
+    nq = tl.arange(0, NQ)
+    p = tl.arange(0, P)
+    sa = tl.zeros([NQ, P], dtype=tl.float32)
+    sb = tl.zeros([NQ, P], dtype=tl.float32)
+    ga = tl.where(half == 0, 0, 1)  # first column group of this program
+    gb = ga + 2
+    for j0 in range(0, cl, LB):
+        rm = j0 + m // R < cl
+        tok0 = cs + j0
+        tokr = tok0 + m // R
+        xo = (tok0 * R + m)[:, None] * N + nq[None, :]
+        bo = (h * R + m % R)[:, None] * N + nq[None, :]
+        xa = (tl.load(K_ptr + xo + ga * NQ, mask=rm[:, None], other=0.0) + tl.load(kb_ptr + bo + ga * NQ).to(tl.bfloat16)).to(tl.float32)
+        xb = (tl.load(K_ptr + xo + gb * NQ, mask=rm[:, None], other=0.0) + tl.load(kb_ptr + bo + gb * NQ).to(tl.bfloat16)).to(tl.float32)
+        if half == 0:
+            toff = (tokr[:, None] * H + h) * NQ + nq[None, :]
+            cr = tl.load(cl_ptr + toff, mask=rm[:, None], other=1.0).to(tl.float32)
+            sr = tl.load(sl_ptr + toff, mask=rm[:, None], other=0.0).to(tl.float32)
+            ka = (cr * xa - sr * xb).to(tl.bfloat16).to(tl.float32)
+            kb2 = (sr * xa + cr * xb).to(tl.bfloat16).to(tl.float32)
+        else:
+            ka = xa.to(tl.bfloat16).to(tl.float32)
+            kb2 = xb.to(tl.bfloat16).to(tl.float32)
+        w = tl.where(rm, tl.load(ts_ptr + h * T + tokr, mask=rm, other=0.0)
+                     * tl.exp(dlast - tl.load(dacs_ptr + h * T + tokr, mask=rm, other=0.0)), 0.0)
+        psiv = _load_psiv(V_ptr, psi_ptr, h, tok0, m, rm, H, R, P)
+        sa = tl.dot(tl.trans((ka * w[:, None]).to(tl.bfloat16)), psiv, sa)
+        sb = tl.dot(tl.trans((kb2 * w[:, None]).to(tl.bfloat16)), psiv, sb)
+    base = Sloc_ptr + (c * H + h).to(tl.int64) * N * P
+    tl.store(base + (ga * NQ + nq[:, None]) * P + p[None, :], sa)
+    tl.store(base + (gb * NQ + nq[:, None]) * P + p[None, :], sb)
 
 
 def _chunk_layout(cu: list[int], ls: int):

@@ -386,6 +386,51 @@ def _reconstruct_dense_kernel(
             tl.store(op + (obase[:, None] * HKV_ + h) * D_ + d[None, :], acc.to(op.dtype.element_ty), mask=tmask[:, None])
 
 
+@triton.jit
+def _reconstruct_dense_kernel2(
+    k_plane_ptr, v_plane_ptr, bt_ptr, starts_ptr, lens_ptr, k_out_ptr, v_out_ptr,
+    plane_bstride, bt_stride, block_size,
+    HKV_: tl.constexpr, HP: tl.constexpr, R_: tl.constexpr, D_: tl.constexpr, OFF_C_: tl.constexpr,
+    OFF_D_: tl.constexpr, BT: tl.constexpr,
+):
+    """(request, BT-token tile, plane): every kv head at once; the B rows of the tile and of the
+    previous tokens are read once (the per-head loop of _reconstruct_dense_kernel re-read them HKV times)."""
+    req = tl.program_id(0)
+    tile = tl.program_id(1)
+    which = tl.program_id(2)
+    n = tl.load(lens_ptr + req)
+    if tile * BT >= n:
+        return
+    pl = k_plane_ptr if which == 0 else v_plane_ptr
+    op = k_out_ptr if which == 0 else v_out_ptr
+    t = tile * BT + tl.arange(0, BT)
+    tmask = t < n
+    tp = tl.maximum(t - 1, 0)
+    has_prev = (t > 0) & tmask
+    blk = tl.load(bt_ptr + req * bt_stride + t // block_size, mask=tmask, other=0).to(tl.int64)
+    blkp = tl.load(bt_ptr + req * bt_stride + tp // block_size, mask=tmask, other=0).to(tl.int64)
+    W: tl.constexpr = OFF_D_ + HKV_ * R_
+    row = blk * plane_bstride + (t % block_size).to(tl.int64) * W
+    rowp = blkp * plane_bstride + (tp % block_size).to(tl.int64) * W
+    d = tl.arange(0, D_)
+    hh = tl.arange(0, HP)
+    hm = hh < HKV_
+    acc = tl.zeros([BT, HP, D_], dtype=tl.float32)
+    for r in tl.static_range(R_):
+        b = tl.load(pl + row[:, None] + r * D_ + d[None, :], mask=tmask[:, None], other=0.0).to(tl.float32)
+        bp = tl.load(pl + rowp[:, None] + r * D_ + d[None, :], mask=has_prev[:, None], other=0.0).to(tl.float32)
+        c = tl.load(pl + row[:, None] + OFF_C_ + hh[None, :] * R_ + r, mask=tmask[:, None] & hm[None, :], other=0.0).to(tl.float32)
+        dc = tl.load(pl + row[:, None] + OFF_D_ + hh[None, :] * R_ + r, mask=tmask[:, None] & hm[None, :], other=0.0).to(tl.float32)
+        acc += c[:, :, None] * b[:, None, :] + dc[:, :, None] * bp[:, None, :]
+    obase = (tl.load(starts_ptr + req) + t).to(tl.int64)
+    tl.store(op + (obase[:, None, None] * HKV_ + hh[None, :, None]) * D_ + d[None, None, :],
+             acc.to(op.dtype.element_ty), mask=tmask[:, None, None] & hm[None, :, None])
+
+
+_RECON_BT = int(os.environ.get("OLALA_RECON_BT", "8"))
+_RECON_NW = int(os.environ.get("OLALA_RECON_NW", "4"))
+
+
 def reconstruct_dense_kv(kplane: torch.Tensor, vplane: torch.Tensor, block_tables: torch.Tensor,
                          lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense (sum(lengths), HKV, D) K and V of several requests, concatenated, in one kernel."""
@@ -398,12 +443,13 @@ def reconstruct_dense_kv(kplane: torch.Tensor, vplane: torch.Tensor, block_table
     for L in lengths[:-1]:
         starts.append(starts[-1] + L)
     meta = torch.tensor([starts, lengths], dtype=torch.int32).to(dev, non_blocking=True)
-    BT = 32
-    grid = (len(lengths), triton.cdiv(max(lengths), BT))
-    _reconstruct_dense_kernel[grid](
+    BT = _RECON_BT
+    grid = (len(lengths), triton.cdiv(max(lengths), BT), 2)
+    _reconstruct_dense_kernel2[grid](
         kplane, vplane, block_tables, meta[0], meta[1], k_out, v_out,
         kplane.stride(0), block_tables.stride(0), kplane.shape[1],
-        HKV_=HKV, R_=RANK, D_=HEAD_DIM, OFF_C_=OFF_C, OFF_D_=OFF_D, BT=BT, num_warps=4,
+        HKV_=HKV, HP=triton.next_power_of_2(HKV), R_=RANK, D_=HEAD_DIM, OFF_C_=OFF_C, OFF_D_=OFF_D, BT=BT,
+        num_warps=_RECON_NW,
     )
     return k_out, v_out
 
