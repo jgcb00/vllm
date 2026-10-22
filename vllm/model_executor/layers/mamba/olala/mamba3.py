@@ -245,11 +245,11 @@ def _prefill_prologue_kernel(
     dt_bias_ptr, a_floor, wb_ptr, wc_ptr, eps,
     T, H, R, n_pre,
     D: tl.constexpr, S: tl.constexpr, NA: tl.constexpr, BT: tl.constexpr, ZERO_CENTERED: tl.constexpr,
+    R2: tl.constexpr,
 ):
     """Prefill counterpart of _decode_preamble_bc_kernel, in one launch: programs [0, n_pre) handle a
     (BT-token tile, head) of the in_proj output (z/x copies and the dt / A / trap chain, written
-    head-major), the others one (token, B or C, mimo row) RMS norm; row j == 0 also copies the
-    rotary angles."""
+    head-major), the others one token's B / C RMS norms and its rotary angles."""
     pid = tl.program_id(0)
     if pid < n_pre:
         h = pid % H
@@ -270,27 +270,24 @@ def _prefill_prologue_kernel(
         tl.store(adt_ptr + h * T + t, tl.minimum(-sp_a, -a_floor) * sp_dt, mask=tm)
         tl.store(trap_ptr + h * T + t, trap, mask=tm)
     else:
-        q = pid - n_pre
-        j = q % (2 * R)
-        tok = q // (2 * R)
-        r = j % R
-        is_c = j >= R
-        bcrow = bc_ptr + tok.to(tl.int64) * stride_bc + r * S + is_c.to(tl.int32) * (R * S)
+        # one token per program: its R B rows and R C rows (the bc row is [B (R x S) | C (R x S) | angles])
+        tok = (pid - n_pre).to(tl.int64)
+        j = tl.arange(0, R2)
+        is_c = j >= R2 // 2
         offs = tl.arange(0, S)
-        vals = tl.load(bcrow + offs).to(tl.float32)
-        inv = 1.0 / tl.sqrt(tl.sum(vals * vals) / S + eps)
+        vals = tl.load(bc_ptr + tok * stride_bc + j[:, None] * S + offs[None, :]).to(tl.float32)
+        inv = 1.0 / tl.sqrt(tl.sum(vals * vals, axis=1) / S + eps)
         # same roundings as OlalaRMSNorm: rms_norm output in the activation dtype, gain (1 + w)
         # in the parameter dtype, product rounded once more
-        w = tl.where(is_c, tl.load(wc_ptr + offs), tl.load(wb_ptr + offs))
+        w = tl.where(is_c[:, None], tl.load(wc_ptr + offs)[None, :], tl.load(wb_ptr + offs)[None, :])
         if ZERO_CENTERED:
             w = (w.to(tl.float32) + 1.0).to(wb_ptr.dtype.element_ty)
-        y = ((vals * inv).to(q_ptr.dtype.element_ty).to(tl.float32) * w.to(tl.float32)).to(q_ptr.dtype.element_ty)
-        dst = tl.where(is_c, q_ptr, k_ptr) + (tok.to(tl.int64) * R + r) * S + offs
-        tl.store(dst, y)
-        if j == 0:
-            na = tl.arange(0, NA)
-            tl.store(ang_ptr + tok.to(tl.int64) * NA + na,
-                     tl.load(bc_ptr + tok.to(tl.int64) * stride_bc + 2 * R * S + na).to(tl.float32))
+        y = ((vals * inv[:, None]).to(q_ptr.dtype.element_ty).to(tl.float32) * w.to(tl.float32)).to(q_ptr.dtype.element_ty)
+        r = j % (R2 // 2)
+        tl.store(k_ptr + (tok * (R2 // 2) + r[:, None]) * S + offs[None, :], y, mask=~is_c[:, None])
+        tl.store(q_ptr + (tok * (R2 // 2) + r[:, None]) * S + offs[None, :], y, mask=is_c[:, None])
+        na = tl.arange(0, NA)
+        tl.store(ang_ptr + tok * NA + na, tl.load(bc_ptr + tok * stride_bc + R2 * S + na).to(tl.float32))
 
 
 class OlalaMamba3Mixer(PluggableLayer, MambaBase):
@@ -423,6 +420,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             and self.in_proj_dyn.bias is None
             and pow2(self.headdim)
             and pow2(self.d_state)
+            and pow2(2 * self.mimo_dim)
             and self.num_rope_angles == self.d_state // self.rotary_dim_divisor
         )
         if self._postgate_norm:
@@ -797,11 +795,11 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         ang = torch.empty(T, self.num_rope_angles, device=dev, dtype=torch.float32)
         BT = 16
         n_pre = triton.cdiv(T, BT) * H
-        _prefill_prologue_kernel[(n_pre + T * 2 * R,)](
+        _prefill_prologue_kernel[(n_pre + T,)](
             zxdt, zxdt.stride(0), bc, bc.stride(0), x, z, DT, ADT, trap, Q, K, ang,
             self.dt_bias, self.A_floor, self.B_norm.norm.weight, self.C_norm.norm.weight, self.B_norm.norm.eps,
             T, H, R, n_pre, D=D, S=S, NA=self.num_rope_angles, BT=BT,
-            ZERO_CENTERED=self.B_norm.norm.zero_centered, num_warps=4,
+            ZERO_CENTERED=self.B_norm.norm.zero_centered, R2=2 * R, num_warps=2,
         )
         cw = self._prefill_const_w
         if cw is None:

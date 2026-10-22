@@ -37,8 +37,12 @@ _SCAN_CUDA = _os.environ.get("OLALA_SCAN_CUDA", "1") == "1"  # sm_90 only (wgmma
 _SCAN_EXT = None
 
 
+_CS_CUDA = _os.environ.get("OLALA_CS_CUDA", "1") == "1"
+
+
 def _scan_cuda_ok(dev) -> bool:
     return _SCAN_CUDA and torch.cuda.get_device_capability(dev) == (9, 0)
+
 
 
 def _scan_ext():
@@ -66,7 +70,7 @@ def _ssd_prep(
     ang_ptr, DT_ptr, ADT_ptr, TRAP_ptr, ch_start_ptr, ch_len_ptr, ch_send_ptr,
     dacs_ptr, ts_ptr, gam_ptr, thl_ptr, dtot_ptr, asum_ptr, cl_ptr, sl_ptr,
     T, H, NQ: tl.constexpr, LS: tl.constexpr,
-    dcs16_ptr=None, dcsr16_ptr=None, G16: tl.constexpr = 0,
+    dcs16_ptr=None, dcsr16_ptr=None, G16: tl.constexpr = 0, WRITE_CS: tl.constexpr = True,
 ):
     c = tl.program_id(0)
     h = tl.program_id(1)
@@ -99,8 +103,9 @@ def _ssd_prep(
     inc = _tanh(a) * 3.141592653589793 * dtv[:, None]
     thl = tl.cumsum(inc, axis=0)
     tl.store(thl_ptr + (t[:, None] * H + h) * NQ + nq[None, :], thl, mask=tm[:, None])
-    tl.store(cl_ptr + (t[:, None] * H + h) * NQ + nq[None, :], tl.cos(thl).to(tl.float16), mask=tm[:, None])
-    tl.store(sl_ptr + (t[:, None] * H + h) * NQ + nq[None, :], tl.sin(thl).to(tl.float16), mask=tm[:, None])
+    if WRITE_CS:  # fp16 cos / sin tables for the Triton chunk-state kernels
+        tl.store(cl_ptr + (t[:, None] * H + h) * NQ + nq[None, :], tl.cos(thl).to(tl.float16), mask=tm[:, None])
+        tl.store(sl_ptr + (t[:, None] * H + h) * NQ + nq[None, :], tl.sin(thl).to(tl.float16), mask=tm[:, None])
     tl.store(asum_ptr + (c * H + h) * NQ + nq, tl.sum(inc, axis=0))
 
 
@@ -1170,8 +1175,11 @@ def mamba3_mimo_hybrid_pools(
     v_cu, m_lrow, m_end = take(NC + 1), take(NS), take(NS)
     f32 = dict(device=dev, dtype=torch.float32)
     dacs, ts, gam = torch.empty(H, T, **f32), torch.empty(H, T, **f32), torch.empty(H, T, **f32)
-    cl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
-    sl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
+    cs_cuda = _CS_CUDA and _scan_cuda_ok(dev)
+    cl_t = sl_t = None  # fp16 cos / sin tables, only for the Triton chunk-state kernels
+    if not cs_cuda:
+        cl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
+        sl_t = torch.empty(T, H, NQ, device=dev, dtype=torch.float16)
     thl = torch.empty(T, H, NQ, **f32)
     dtot, asum = torch.empty(NC, H, **f32), torch.empty(NC, H, NQ, **f32)
     Sloc = torch.empty(NC, H, N, P, **f32)
@@ -1183,8 +1191,10 @@ def mamba3_mimo_hybrid_pools(
     DA_CS_REV = torch.empty(1, H, T, **f32)
     _ssd_prep[(NC, H)](angles, DT, ADT, Trap, m_start, m_len, m_send, dacs, ts, gam, thl, dtot, asum, cl_t, sl_t,
                        T, H, NQ=NQ, LS=chunk_tokens, dcs16_ptr=DA_CS, dcsr16_ptr=DA_CS_REV, G16=tl_chunk,
-                       num_warps=tune.get("prep_nw", 8))
-    if tune.get("cs_half", False):
+                       WRITE_CS=not cs_cuda, num_warps=tune.get("prep_nw", 8))
+    if cs_cuda:
+        _scan_ext().chunk_state(K, V, k_bias, psi, thl, dacs, ts, dtot, m_start, m_len, Sloc, NC)
+    elif tune.get("cs_half", False):
         _ssd_chunk_state_half[(NC, H, 2)](K, V, k_bias, psi, cl_t, sl_t, dacs, ts, dtot, m_start, m_len, Sloc, T, H,
                                           R=R, N=N, P=P, NQ=NQ, LB=tune.get("cs_lb", 16), num_warps=tune.get("cs_nw", 4))
     else:

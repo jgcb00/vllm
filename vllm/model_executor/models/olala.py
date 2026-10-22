@@ -40,6 +40,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.mamba.olala.decode_gemv import olala_linear
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
@@ -334,6 +335,12 @@ class OlalaLatentMoE(nn.Module):
             latent, _ = self.fc1_latent_proj(hidden_states)
             routed = self.experts(hidden_states=latent, router_logits=router_logits)
             out, _ = self.fc2_latent_proj(routed)
+            if current_platform.is_cuda():
+                # shared expert: one relu^2 kernel (this runs eagerly inside the opaque MoE op, where the
+                # native activation is two kernels) and the shared + routed add in the down GEMM (beta = 1)
+                s, _ = self.shared_experts.up_proj(hidden_states)
+                torch.ops._C.relu_squared(s, s)
+                return torch.addmm(out, s, self.shared_experts.down_proj.weight.t())
             return out + self.shared_experts(hidden_states)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
