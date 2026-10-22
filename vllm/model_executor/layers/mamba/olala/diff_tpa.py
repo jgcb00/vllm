@@ -48,6 +48,7 @@ from vllm.model_executor.layers.mamba.olala.tpa_factor import (
     reconstruct_dense_kv,
     write_rows,
 )
+from vllm.model_executor.layers.mamba.olala.tpa_prefill import tpa_prefill_q, tpa_prefill_rows
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_varlen_func,
     get_flash_attn_version,
@@ -634,12 +635,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
         npt = q_all.shape[0]
         H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
         dev = q_all.device
-        A_k = A_k_all.view(npt, H, R)
-        A_v = A_v_all.view(npt, H, R)
-        B_k = B_k_all.view(npt, R, D)
-        B_v = B_v_all.view(npt, R, D)
-        k = torch.bmm(A_k, B_k).div_(R)
-        v = torch.bmm(A_v, B_v).div_(R)
+        fused_glue = os.environ.get("OLALA_TPA_GLUE_TORCH") != "1"
 
         # Previous-token seeds: in-batch predecessor, or the pool (or zero) at a request start.
         # host-side filtering and one async upload (device boolean indexing / torch.tensor(device=)
@@ -657,6 +653,52 @@ class OlalaDiffTPAAttention(PluggableLayer):
         init_t = meta[3 * nk:4 * nk].bool()
         cu_q_dev = meta[4 * nk:4 * nk + nreq + 1].to(torch.int32)
         cu_k_dev = meta[4 * nk + nreq + 1:].to(torch.int32)
+        k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+        if fused_glue:
+            tpa_prefill_rows(
+                A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, positions, slots,
+                starts, ends, pslots_t, init_t, (k_pool, v_pool, ak_pool, av_pool),
+                self.k_norm.norm.weight, self.k_norm.norm.eps, kplane, vplane, H, R, D,
+            )
+            q = tpa_prefill_q(
+                q_all, positions, self.q_norm.norm.weight, self.softmax_scaler, self.q_norm.norm.eps,
+                float(getattr(self.config, "sliding_window_size", 0) or 0),
+                self.num_attention_heads_local, D,
+            )
+        else:
+            q = self._factor_prefill_glue_torch(
+                positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, slots,
+                kplane, vplane, starts, ends, pslots_t, init_t,
+            )
+        bt_rows = md.block_table[bt0 : bt0 + nreq]
+        if os.environ.get("OLALA_TPA_RECON_TORCH") == "1":  # reference path (A/B checks)
+            k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
+            v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
+        else:
+            k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
+        out = flash_attn_varlen_func(
+            q=q, k=k_all, v=v_all,
+            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
+            cu_seqlens_q=cu_q_dev,
+            max_seqlen_k=max(lengths),
+            cu_seqlens_k=cu_k_dev,
+            softmax_scale=self.scale, causal=True, softcap=self.softcap,
+            fa_version=get_flash_attn_version(),
+        )
+        return out.reshape(npt, -1)
+
+    def _factor_prefill_glue_torch(self, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                                   alpha_k_all, alpha_v_all, slots, kplane, vplane,
+                                   starts, ends, pslots_t, init_t) -> torch.Tensor:
+        """Torch reference of tpa_prefill_rows + tpa_prefill_q (OLALA_TPA_GLUE_TORCH=1)."""
+        npt = q_all.shape[0]
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
+        A_k = A_k_all.view(npt, H, R)
+        A_v = A_v_all.view(npt, H, R)
+        B_k = B_k_all.view(npt, R, D)
+        B_v = B_v_all.view(npt, R, D)
+        k = torch.bmm(A_k, B_k).div_(R)
+        v = torch.bmm(A_v, B_v).div_(R)
         k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
 
         def seeded(cur: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
@@ -682,24 +724,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
         kw = (1.0 + self.k_norm.norm.weight.float()).to(k.dtype)
         write_rows(kplane, slots, factor_rows(A_k, ak_prev, B_k, a_k, inv, kw))
         write_rows(vplane, slots, factor_rows(A_v, av_prev, B_v, a_v, None, None))
-
-        q = self._q_for_attention(q_all, positions)
-        bt_rows = md.block_table[bt0 : bt0 + nreq]
-        if os.environ.get("OLALA_TPA_RECON_TORCH") == "1":  # reference path (A/B checks)
-            k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
-            v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
-        else:
-            k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
-        out = flash_attn_varlen_func(
-            q=q, k=k_all, v=v_all,
-            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
-            cu_seqlens_q=cu_q_dev,
-            max_seqlen_k=max(lengths),
-            cu_seqlens_k=cu_k_dev,
-            softmax_scale=self.scale, causal=True, softcap=self.softcap,
-            fa_version=get_flash_attn_version(),
-        )
-        return out.reshape(npt, -1)
+        return self._q_for_attention(q_all, positions)
 
     def _factor_dry_run(self, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
                         alpha_k_all, alpha_v_all, attn_out) -> None:
