@@ -36,12 +36,16 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         layer.weight_block_size = None
+        # Non-gated activations (e.g. relu2_no_mul) have a single up projection.
+        w13_rows = (
+            2 if self.moe.is_act_and_mul else 1
+        ) * intermediate_size_per_partition
 
         # Fused gate_up_proj (column parallel) — full precision on meta device
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_rows,
                 hidden_size,
                 device="meta",
                 dtype=params_dtype,
@@ -70,7 +74,7 @@ class OnlineMoEMethodBase(FusedMoEMethodBase):
             w13_bias = torch.nn.Parameter(
                 torch.zeros(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_rows,
                     device="meta",
                     dtype=layer.orig_dtype,
                 ),

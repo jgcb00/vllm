@@ -29,7 +29,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.diff_tpa_decode import (
     tpa_decode_qkv,
@@ -45,8 +45,10 @@ from vllm.model_executor.layers.mamba.olala.tpa_factor import (
     factor_rows,
     num_splits_for_batch,
     reconstruct_dense_batched,
+    reconstruct_dense_kv,
     write_rows,
 )
+from vllm.model_executor.layers.mamba.olala.tpa_prefill import tpa_prefill_q, tpa_prefill_rows
 from vllm.v1.attention.backends.fa_utils import (
     flash_attn_varlen_func,
     get_flash_attn_version,
@@ -417,7 +419,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             # The input projections share one GEMM over concatenated weights
             # streaming GEMV over their concatenated weights.
             w_all = self._decode_proj_weight()
-            allp = decode_gemv(hidden_states, w_all) if n == 1 else F.linear(hidden_states, w_all)
+            if n == 1:
+                allp = decode_gemv(hidden_states, w_all)
+            else:
+                allp = F.linear(hidden_states, self._decode_proj_w_padded)[:, : w_all.shape[0]]
             parts = torch.split(allp, self._decode_proj_sizes, dim=-1)
             q_all, A_k_all, A_v_all, B_k_all, B_v_all, lam_all = parts[:6]
             shift_alphas = tuple(parts[6:]) if self.token_shift else None
@@ -630,19 +635,70 @@ class OlalaDiffTPAAttention(PluggableLayer):
         npt = q_all.shape[0]
         H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
         dev = q_all.device
+        fused_glue = os.environ.get("OLALA_TPA_GLUE_TORCH") != "1"
+
+        # Previous-token seeds: in-batch predecessor, or the pool (or zero) at a request start.
+        # host-side filtering and one async upload (device boolean indexing / torch.tensor(device=)
+        # would each synchronize the stream)
+        keep = [r for r in range(nreq) if qsl[r + 1] > qsl[r]]
+        lengths = [int(x) for x in seq_lens_cpu]
+        cu_k = [0]
+        for L in lengths:
+            cu_k.append(cu_k[-1] + L)
+        nk = len(keep)
+        meta = torch.tensor([qsl[r] for r in keep] + [qsl[r + 1] for r in keep] + [int(pslots[r]) for r in keep]
+                            + [int(bool(has_init[r])) for r in keep] + [int(x) for x in qsl] + cu_k,
+                            dtype=torch.int64).to(dev, non_blocking=True)
+        starts, ends, pslots_t = meta[:nk], meta[nk:2 * nk], meta[2 * nk:3 * nk]
+        init_t = meta[3 * nk:4 * nk].bool()
+        cu_q_dev = meta[4 * nk:4 * nk + nreq + 1].to(torch.int32)
+        cu_k_dev = meta[4 * nk + nreq + 1:].to(torch.int32)
+        k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
+        if fused_glue:
+            tpa_prefill_rows(
+                A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, positions, slots,
+                starts, ends, pslots_t, init_t, (k_pool, v_pool, ak_pool, av_pool),
+                self.k_norm.norm.weight, self.k_norm.norm.eps, kplane, vplane, H, R, D,
+            )
+            q = tpa_prefill_q(
+                q_all, positions, self.q_norm.norm.weight, self.softmax_scaler, self.q_norm.norm.eps,
+                float(getattr(self.config, "sliding_window_size", 0) or 0),
+                self.num_attention_heads_local, D,
+            )
+        else:
+            q = self._factor_prefill_glue_torch(
+                positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all, alpha_k_all, alpha_v_all, slots,
+                kplane, vplane, starts, ends, pslots_t, init_t,
+            )
+        bt_rows = md.block_table[bt0 : bt0 + nreq]
+        if os.environ.get("OLALA_TPA_RECON_TORCH") == "1":  # reference path (A/B checks)
+            k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
+            v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
+        else:
+            k_all, v_all = reconstruct_dense_kv(kplane, vplane, bt_rows, lengths)
+        out = flash_attn_varlen_func(
+            q=q, k=k_all, v=v_all,
+            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
+            cu_seqlens_q=cu_q_dev,
+            max_seqlen_k=max(lengths),
+            cu_seqlens_k=cu_k_dev,
+            softmax_scale=self.scale, causal=True, softcap=self.softcap,
+            fa_version=get_flash_attn_version(),
+        )
+        return out.reshape(npt, -1)
+
+    def _factor_prefill_glue_torch(self, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
+                                   alpha_k_all, alpha_v_all, slots, kplane, vplane,
+                                   starts, ends, pslots_t, init_t) -> torch.Tensor:
+        """Torch reference of tpa_prefill_rows + tpa_prefill_q (OLALA_TPA_GLUE_TORCH=1)."""
+        npt = q_all.shape[0]
+        H, R, D = self.num_kv_heads_local, self.rank, self.head_dim
         A_k = A_k_all.view(npt, H, R)
         A_v = A_v_all.view(npt, H, R)
         B_k = B_k_all.view(npt, R, D)
         B_v = B_v_all.view(npt, R, D)
         k = torch.bmm(A_k, B_k).div_(R)
         v = torch.bmm(A_v, B_v).div_(R)
-
-        # Previous-token seeds: in-batch predecessor, or the pool (or zero) at a request start.
-        qsl_t = torch.tensor(qsl, dtype=torch.int64, device=dev)
-        nonempty = qsl_t[1:] > qsl_t[:-1]
-        starts, ends = qsl_t[:-1][nonempty], qsl_t[1:][nonempty]
-        pslots_t = torch.tensor([int(x) for x in pslots], dtype=torch.int64, device=dev)[nonempty]
-        init_t = torch.tensor([bool(x) for x in has_init], dtype=torch.bool, device=dev)[nonempty]
         k_pool, v_pool, ak_pool, av_pool = self.shift_state.kv_cache
 
         def seeded(cur: torch.Tensor, pool: torch.Tensor) -> torch.Tensor:
@@ -668,25 +724,7 @@ class OlalaDiffTPAAttention(PluggableLayer):
         kw = (1.0 + self.k_norm.norm.weight.float()).to(k.dtype)
         write_rows(kplane, slots, factor_rows(A_k, ak_prev, B_k, a_k, inv, kw))
         write_rows(vplane, slots, factor_rows(A_v, av_prev, B_v, a_v, None, None))
-
-        q = self._q_for_attention(q_all, positions)
-        lengths = [int(x) for x in seq_lens_cpu]
-        bt_rows = md.block_table[bt0 : bt0 + nreq]
-        k_all = reconstruct_dense_batched(kplane, bt_rows, lengths)
-        v_all = reconstruct_dense_batched(vplane, bt_rows, lengths)
-        cu_k = [0]
-        for L in lengths:
-            cu_k.append(cu_k[-1] + L)
-        out = flash_attn_varlen_func(
-            q=q, k=k_all, v=v_all,
-            max_seqlen_q=max(qsl[r + 1] - qsl[r] for r in range(nreq)),
-            cu_seqlens_q=torch.tensor(qsl, dtype=torch.int32, device=dev),
-            max_seqlen_k=max(lengths),
-            cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=dev),
-            softmax_scale=self.scale, causal=True, softcap=self.softcap,
-            fa_version=get_flash_attn_version(),
-        )
-        return out.reshape(npt, -1)
+        return self._q_for_attention(q_all, positions)
 
     def _factor_dry_run(self, positions, q_all, A_k_all, A_v_all, B_k_all, B_v_all,
                         alpha_k_all, alpha_v_all, attn_out) -> None:
@@ -737,7 +775,10 @@ class OlalaDiffTPAAttention(PluggableLayer):
             if self.token_shift:
                 mods = mods + (self.shift_proj_k, self.shift_proj_v)
             self._decode_proj_sizes = [m.weight.shape[0] for m in mods]
-            w = torch.cat([m.weight for m in mods], 0).contiguous()
+            n = sum(self._decode_proj_sizes)
+            w = cat_rows_shared([m.weight for m in mods], pad_to=128)
+            self._decode_proj_w_padded = w  # prefill GEMM: aligned width (Hopper cuBLAS kernels)
+            w = w[:n]
             self._decode_proj_w = w
         return w
 

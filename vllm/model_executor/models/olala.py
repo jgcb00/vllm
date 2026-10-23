@@ -26,6 +26,7 @@ Known fidelity gaps, flagged rather than papered over:
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from collections.abc import Callable, Iterable
@@ -39,6 +40,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import get_current_vllm_config, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
 from vllm.model_executor.layers.mamba.olala.decode_gemv import olala_linear
 from vllm.model_executor.layers.mamba.olala.latent_moe_decode import (
@@ -82,6 +84,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -162,6 +165,12 @@ class OlalaSharedMLP(nn.Module):
         return x
 
 
+@functools.cache
+def _int8_skip_layers() -> frozenset[int]:
+    raw = os.environ.get("OLALA_INT8_SKIP_LAYERS", "")
+    return frozenset(int(x) for x in raw.replace(" ", "").split(",") if x)
+
+
 class OlalaLatentMoE(nn.Module):
     """Latent MoE with sigmoid routing and non-gated ReLU² experts.
 
@@ -178,6 +187,13 @@ class OlalaLatentMoE(nn.Module):
         self.top_k = config.moe_num_active_experts
         if not self.latent_size:
             raise ValueError("OlalaLatentMoE requires moe_routed_input_dim")
+        # --quantization experts_int8: routed experts W8A16 (per-channel int8
+        # weights, bf16 activations), every linear stays bf16. Layers listed
+        # in OLALA_INT8_SKIP_LAYERS keep bf16 experts too.
+        experts_int8 = quant_config is not None and quant_config.get_name() == "experts_int8"
+        experts_quant_config = quant_config
+        if experts_int8 and extract_layer_index(prefix) in _int8_skip_layers():
+            experts_quant_config = None
 
         self.gate = GateLinear(
             self.hidden_size,
@@ -227,7 +243,7 @@ class OlalaLatentMoE(nn.Module):
         # router weights. Otherwise the runner owns transforms and shared.
         self._fused_proj = (
             self.shared_experts is not None
-            and quant_config is None
+            and (quant_config is None or experts_int8)
             and get_tensor_model_parallel_world_size() == 1
             and not parallel_config.enable_eplb
         )
@@ -245,7 +261,7 @@ class OlalaLatentMoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=parallel_config.eplb_config.num_redundant_experts,
-            quant_config=quant_config,
+            quant_config=experts_quant_config,
             prefix=f"{prefix}.experts",
         )
         if self._fused_proj:
@@ -303,6 +319,8 @@ class OlalaLatentMoE(nn.Module):
                 re.w2_weight,
                 self.top_k,
                 self.routed_scaling_factor,
+                w13_scale=getattr(re, "w13_scale", None),
+                w2_scale=getattr(re, "w2_scale", None),
             )
         if self._fused_proj and hidden_states.shape[0] <= FUSED_PROJ_MAX_TOKENS:
             w_in, w_out = self._small_path_weights()
@@ -317,6 +335,12 @@ class OlalaLatentMoE(nn.Module):
             latent, _ = self.fc1_latent_proj(hidden_states)
             routed = self.experts(hidden_states=latent, router_logits=router_logits)
             out, _ = self.fc2_latent_proj(routed)
+            if current_platform.is_cuda():
+                # shared expert: one relu^2 kernel (this runs eagerly inside the opaque MoE op, where the
+                # native activation is two kernels) and the shared + routed add in the down GEMM (beta = 1)
+                s, _ = self.shared_experts.up_proj(hidden_states)
+                torch.ops._C.relu_squared(s, s)
+                return torch.addmm(out, s, self.shared_experts.down_proj.weight.t())
             return out + self.shared_experts(hidden_states)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)
 

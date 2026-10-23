@@ -17,11 +17,13 @@ with ``Bk' = (1 + w_norm) * B``, ``Ck = (1 - a) * inv_rms * A / R`` and
 the dense ``2 * 12 * 128`` bf16 per token, the cache keeps two 608-element
 rows per token (``[B (4x128) | C (12x4) | D (12x4)]`` for K and for V):
 2.5x less KV memory and 2.5x less decode-time KV traffic. Decode attention
-runs a dedicated sm_90 kernel over the factors; prefill reconstructs the
-dense K/V of its context and runs FlashAttention varlen.
+runs a dedicated kernel over the factors (sm_90a wgmma on Hopper, mma.sync
+on other sm_80+ GPUs); prefill reconstructs the dense K/V of its context and
+runs FlashAttention varlen.
 
-Rows are stored in plain ``[r][d]`` order; the decode kernel streams them
-with TMA tensor copies (128-byte swizzle) into the canonical wgmma layouts.
+Rows are stored in plain ``[r][d]`` order; the Hopper kernel streams them
+with TMA tensor copies (128-byte swizzle) into the canonical wgmma layouts,
+the sm_80 kernel with cp.async into padded shared-memory rows.
 """
 
 from __future__ import annotations
@@ -53,27 +55,29 @@ HQP = 64  # query heads padded to the kernel's accumulator rows
 ROWP = RANK * HEAD_DIM + 2 * HKV * RANK  # 608 bf16 per plane row
 OFF_C, OFF_D = RANK * HEAD_DIM, RANK * HEAD_DIM + HKV * RANK
 TILE = 13  # tokens per kernel tile; block sizes are multiples of it
-TARGET_CTAS = 400  # ~3 CTAs per SM on GH200
+TARGET_CTAS = 400  # ~3 CTAs per SM on GH200 (Hopper kernel)
 logger = init_logger(__name__)
 
 MIN_SPLIT_TOKENS = 2 * TILE  # at least two tiles per active split; extra splits stay empty (cheap)
+SPLIT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 
 
 @lru_cache(maxsize=1)
 def factor_cache_enabled() -> bool:
-    """OLALA_TPA_FACTOR (default on), on Hopper only (the decode kernel is
-    sm_90a wgmma), and only if its JIT build succeeds: otherwise the dense
-    paged KV path is used, with a warning instead of a failed first forward."""
+    """OLALA_TPA_FACTOR (default on), on sm_80+ (sm_90a wgmma kernel on
+    Hopper, mma.sync kernel elsewhere), and only if its JIT build succeeds:
+    otherwise the dense paged KV path is used, with a warning instead of a
+    failed first forward."""
     if os.environ.get("OLALA_TPA_FACTOR", "1") == "0":
         logger.info("Olala: TPA factor cache disabled by OLALA_TPA_FACTOR=0.")
         return False
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         warn_slow_path(
             "TPA factor KV cache disabled",
-            f"the decode kernel is sm_90a (Hopper) only; this GPU is sm_{cap}",
+            f"the decode kernels need sm_80+; this GPU is sm_{cap}",
             "dense paged KV cache: 2.5x more KV memory and slower long-context decode (up to -40% throughput at 24k)",
-            "run on H100/H200/GH200 (nothing to fix elsewhere; output is correct)",
+            "run on an Ampere or newer GPU (nothing to fix elsewhere; output is correct)",
         )
         return False
     try:
@@ -315,15 +319,28 @@ def factor_rows(
     return torch.cat([swizzle_b(Bp).reshape(n, RANK * HEAD_DIM), C.reshape(n, -1), Dc.reshape(n, -1)], dim=1)
 
 
+@triton.jit
+def _write_rows_kernel(plane_ptr, slots_ptr, rows_ptr, bstride, block_size, W: tl.constexpr, BW: tl.constexpr):
+    i = tl.program_id(0)
+    slot = tl.load(slots_ptr + i).to(tl.int64)
+    if slot < 0:
+        return
+    c = tl.arange(0, BW)
+    v = tl.load(rows_ptr + i.to(tl.int64) * W + c, mask=c < W)
+    tl.store(plane_ptr + (slot // block_size) * bstride + (slot % block_size) * W + c,
+             v.to(plane_ptr.dtype.element_ty), mask=c < W)
+
+
 def write_rows(plane: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
-    """Scatter rows into a (num_blocks, block_size, ROWP) plane (any block stride); slots < 0 are skipped."""
-    valid = slots >= 0
-    if not bool(valid.all()):
-        slots = slots[valid]
-        rows = rows[valid]
-    bs = plane.shape[1]
-    slots = slots.long()
-    plane[slots // bs, slots % bs] = rows.to(plane.dtype)
+    """Scatter rows into a (num_blocks, block_size, ROWP) plane (any block stride); slots < 0 are
+    skipped on the device (no host sync)."""
+    n = rows.shape[0]
+    if n == 0:
+        return
+    assert plane.stride(1) == ROWP and plane.stride(2) == 1
+    rows = rows.contiguous()
+    _write_rows_kernel[(n,)](plane, slots, rows, plane.stride(0), plane.shape[1],
+                             W=ROWP, BW=triton.next_power_of_2(ROWP), num_warps=4)
 
 
 def reconstruct_dense(plane: torch.Tensor, blocks: torch.Tensor, length: int) -> torch.Tensor:
@@ -331,8 +348,115 @@ def reconstruct_dense(plane: torch.Tensor, blocks: torch.Tensor, length: int) ->
     return reconstruct_dense_batched(plane, blocks.unsqueeze(0), [length])
 
 
+@triton.jit
+def _reconstruct_dense_kernel(
+    k_plane_ptr, v_plane_ptr, bt_ptr, starts_ptr, lens_ptr, k_out_ptr, v_out_ptr,
+    plane_bstride, bt_stride, block_size,
+    HKV_: tl.constexpr, R_: tl.constexpr, D_: tl.constexpr, OFF_C_: tl.constexpr, OFF_D_: tl.constexpr,
+    BT: tl.constexpr,
+):
+    """One program per (request, BT-token tile): dense K and V rows of every kv head,
+    out[t, h] = sum_r C[t, h, r] B[t, r] + D[t, h, r] B[t-1, r] (B[-1] = 0 at a request start), fp32 accumulate."""
+    req = tl.program_id(0)
+    tile = tl.program_id(1)
+    n = tl.load(lens_ptr + req)
+    t = tile * BT + tl.arange(0, BT)
+    if tile * BT >= n:
+        return
+    tmask = t < n
+    tp = tl.maximum(t - 1, 0)
+    blk = tl.load(bt_ptr + req * bt_stride + t // block_size, mask=tmask, other=0).to(tl.int64)
+    blkp = tl.load(bt_ptr + req * bt_stride + tp // block_size, mask=tmask, other=0).to(tl.int64)
+    row = blk * plane_bstride + (t % block_size).to(tl.int64) * (OFF_D_ + HKV_ * R_)
+    rowp = blkp * plane_bstride + (tp % block_size).to(tl.int64) * (OFF_D_ + HKV_ * R_)
+    has_prev = (t > 0) & tmask
+    d = tl.arange(0, D_)
+    obase = (tl.load(starts_ptr + req) + t).to(tl.int64)
+    for which in tl.static_range(2):
+        pl = k_plane_ptr if which == 0 else v_plane_ptr
+        op = k_out_ptr if which == 0 else v_out_ptr
+        for h in tl.static_range(HKV_):
+            acc = tl.zeros([BT, D_], dtype=tl.float32)
+            for r in tl.static_range(R_):
+                b = tl.load(pl + row[:, None] + r * D_ + d[None, :], mask=tmask[:, None], other=0.0).to(tl.float32)
+                bp = tl.load(pl + rowp[:, None] + r * D_ + d[None, :], mask=has_prev[:, None], other=0.0).to(tl.float32)
+                c = tl.load(pl + row + OFF_C_ + h * R_ + r, mask=tmask, other=0.0).to(tl.float32)
+                dc = tl.load(pl + row + OFF_D_ + h * R_ + r, mask=tmask, other=0.0).to(tl.float32)
+                acc += c[:, None] * b + dc[:, None] * bp
+            tl.store(op + (obase[:, None] * HKV_ + h) * D_ + d[None, :], acc.to(op.dtype.element_ty), mask=tmask[:, None])
+
+
+@triton.jit
+def _reconstruct_dense_kernel2(
+    k_plane_ptr, v_plane_ptr, bt_ptr, starts_ptr, lens_ptr, k_out_ptr, v_out_ptr,
+    plane_bstride, bt_stride, block_size,
+    HKV_: tl.constexpr, HP: tl.constexpr, R_: tl.constexpr, D_: tl.constexpr, OFF_C_: tl.constexpr,
+    OFF_D_: tl.constexpr, BT: tl.constexpr,
+):
+    """(request, BT-token tile, plane): every kv head at once; the B rows of the tile and of the
+    previous tokens are read once (the per-head loop of _reconstruct_dense_kernel re-read them HKV times)."""
+    req = tl.program_id(0)
+    tile = tl.program_id(1)
+    which = tl.program_id(2)
+    n = tl.load(lens_ptr + req)
+    if tile * BT >= n:
+        return
+    pl = k_plane_ptr if which == 0 else v_plane_ptr
+    op = k_out_ptr if which == 0 else v_out_ptr
+    t = tile * BT + tl.arange(0, BT)
+    tmask = t < n
+    tp = tl.maximum(t - 1, 0)
+    has_prev = (t > 0) & tmask
+    blk = tl.load(bt_ptr + req * bt_stride + t // block_size, mask=tmask, other=0).to(tl.int64)
+    blkp = tl.load(bt_ptr + req * bt_stride + tp // block_size, mask=tmask, other=0).to(tl.int64)
+    W: tl.constexpr = OFF_D_ + HKV_ * R_
+    row = blk * plane_bstride + (t % block_size).to(tl.int64) * W
+    rowp = blkp * plane_bstride + (tp % block_size).to(tl.int64) * W
+    d = tl.arange(0, D_)
+    hh = tl.arange(0, HP)
+    hm = hh < HKV_
+    acc = tl.zeros([BT, HP, D_], dtype=tl.float32)
+    for r in tl.static_range(R_):
+        b = tl.load(pl + row[:, None] + r * D_ + d[None, :], mask=tmask[:, None], other=0.0).to(tl.float32)
+        bp = tl.load(pl + rowp[:, None] + r * D_ + d[None, :], mask=has_prev[:, None], other=0.0).to(tl.float32)
+        c = tl.load(pl + row[:, None] + OFF_C_ + hh[None, :] * R_ + r, mask=tmask[:, None] & hm[None, :], other=0.0).to(tl.float32)
+        dc = tl.load(pl + row[:, None] + OFF_D_ + hh[None, :] * R_ + r, mask=tmask[:, None] & hm[None, :], other=0.0).to(tl.float32)
+        acc += c[:, :, None] * b[:, None, :] + dc[:, :, None] * bp[:, None, :]
+    obase = (tl.load(starts_ptr + req) + t).to(tl.int64)
+    tl.store(op + (obase[:, None, None] * HKV_ + hh[None, :, None]) * D_ + d[None, None, :],
+             acc.to(op.dtype.element_ty), mask=tmask[:, None, None] & hm[None, :, None])
+
+
+_RECON_BT = int(os.environ.get("OLALA_RECON_BT", "8"))
+_RECON_NW = int(os.environ.get("OLALA_RECON_NW", "4"))
+
+
+def reconstruct_dense_kv(kplane: torch.Tensor, vplane: torch.Tensor, block_tables: torch.Tensor,
+                         lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dense (sum(lengths), HKV, D) K and V of several requests, concatenated, in one kernel."""
+    total = sum(lengths)
+    dev = kplane.device
+    assert kplane.stride(1) == ROWP and kplane.stride(2) == 1 and vplane.stride(0) == kplane.stride(0)
+    k_out = torch.empty(total, HKV, HEAD_DIM, dtype=kplane.dtype, device=dev)
+    v_out = torch.empty(total, HKV, HEAD_DIM, dtype=vplane.dtype, device=dev)
+    starts = [0]
+    for L in lengths[:-1]:
+        starts.append(starts[-1] + L)
+    meta = torch.tensor([starts, lengths], dtype=torch.int32).to(dev, non_blocking=True)
+    BT = _RECON_BT
+    grid = (len(lengths), triton.cdiv(max(lengths), BT), 2)
+    _reconstruct_dense_kernel2[grid](
+        kplane, vplane, block_tables, meta[0], meta[1], k_out, v_out,
+        kplane.stride(0), block_tables.stride(0), kplane.shape[1],
+        HKV_=HKV, HP=triton.next_power_of_2(HKV), R_=RANK, D_=HEAD_DIM, OFF_C_=OFF_C, OFF_D_=OFF_D, BT=BT,
+        num_warps=_RECON_NW,
+    )
+    return k_out, v_out
+
+
 def reconstruct_dense_batched(plane: torch.Tensor, block_tables: torch.Tensor, lengths: list[int]) -> torch.Tensor:
-    """Dense (sum(lengths), H, D) K or V of several requests, concatenated.
+    """Dense (sum(lengths), H, D) K or V of several requests, concatenated (torch reference;
+    the prefill path uses the fused :func:`reconstruct_dense_kv`).
 
     ``block_tables[r]`` is request ``r``'s block table row; one gather over
     the plane, one unswizzle and two einsums for the whole batch.
@@ -485,18 +609,59 @@ def factor_decode_write(
 # --------------------------------------------------------------------------
 
 
+def _hopper() -> bool:
+    return torch.cuda.get_device_capability()[0] == 9
+
+
 @lru_cache(maxsize=1)
 def _load_kernel():
     from vllm.model_executor.layers.mamba.olala.jit import load_extension
 
-    ext = load_extension(
-        "olala_tpa_factor_decode",
-        "tpa_factor_decode.cu",
-        ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
-        ["-lcuda"],
-    )
+    if _hopper():
+        ext = load_extension(
+            "olala_tpa_factor_decode",
+            "tpa_factor_decode.cu",
+            ["-O3", "-std=c++17", "--use_fast_math", "-gencode=arch=compute_90a,code=sm_90a"],
+            ["-lcuda"],
+        )
+    else:
+        major, minor = torch.cuda.get_device_capability()
+        sm = f"{major}{minor}"
+        ext = load_extension(
+            f"olala_tpa_factor_decode_sm{sm}",
+            "tpa_factor_decode_sm80.cu",
+            ["-O3", "-std=c++17", "--use_fast_math", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
+        )
     assert ext.TILE == TILE
     return ext
+
+
+@lru_cache(maxsize=1)
+def _target_ctas() -> int:
+    """Decode CTAs to aim for: TARGET_CTAS on Hopper, else one wave of the sm_80 kernel's resident CTAs
+    (two per SM on sm_86 / sm_89)."""
+    if _hopper():
+        return TARGET_CTAS
+    nsm = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return nsm * max(1, int(_load_kernel().occupancy()))
+
+
+def split_table_path() -> str:
+    name = torch.cuda.get_device_name().replace(" ", "_")
+    return os.path.join(SPLIT_TABLE_DIR, f"tpa_factor_splits,device_name={name}.json")
+
+
+@lru_cache(maxsize=1)
+def _split_table() -> list[tuple[int, int]] | None:
+    """Measured best split count per batch size for the sm_80 kernel (blade_attn_bench.py, tune_splits):
+    wave quantization and the merge cost differ too much between GPUs for one formula."""
+    if _hopper() or not os.path.exists(split_table_path()):
+        return None
+    import json
+
+    with open(split_table_path()) as f:
+        table = json.load(f)["splits"]
+    return sorted((int(b), int(n)) for b, n in table.items())
 
 
 @triton.jit
@@ -536,11 +701,19 @@ def _factor_combine_kernel(part_o_ptr, part_m_ptr, part_l_ptr, nactive_ptr, o_pt
 
 
 def num_splits_for_batch(batch: int) -> int:
-    """KV splits per request: ~TARGET_CTAS CTAs in total, rounded up to a power
-    of two so the combine kernel has at most 8 specializations (all compiled
-    during cudagraph capture)."""
-    want = max(1, min(128, -(-TARGET_CTAS // max(batch, 1))))
-    return 1 << (want - 1).bit_length()
+    """KV splits per request, a power of two so the combine kernel has at most 8
+    specializations (all compiled during cudagraph capture). Hopper: ~_target_ctas()
+    CTAs, rounded up. sm_80 kernel: the GPU's measured table (entry of the largest
+    tuned batch <= batch), else the largest count that keeps one wave of CTAs."""
+    batch = max(batch, 1)
+    if _hopper():
+        want = max(1, min(128, -(-_target_ctas() // batch)))
+        return 1 << (want - 1).bit_length()
+    table = _split_table()
+    if table:
+        return next((n for b, n in reversed(table) if b <= batch), table[0][1])
+    want = max(1, min(128, _target_ctas() // batch))
+    return 1 << (want.bit_length() - 1)
 
 
 def factor_decode_attention(

@@ -657,7 +657,8 @@ def mamba_mimo_forward_varlen(q, k, v,
                        outproj_norm_eps=1e-5,
                        threads=128,
                        num_stages=0,
-                       compute_outputs=True):
+                       compute_outputs=True,
+                       out=None):
     """
     Varlen wrapper around ``mamba_mimo_fwd``.
 
@@ -751,7 +752,7 @@ def mamba_mimo_forward_varlen(q, k, v,
     if not compute_outputs:
         o = None  # state-only pass: O is compile-time unused in the kernel
     elif reduceO:
-        o = torch.empty((B, S, H, P), device='cuda', dtype=dtype)
+        o = out if out is not None else torch.empty((B, S, H, P), device='cuda', dtype=dtype)
     else:
         o = torch.empty((B, S, R, H, P), device='cuda', dtype=dtype)
     # TileLang accepts None for tensor arguments that are compile-time unused.

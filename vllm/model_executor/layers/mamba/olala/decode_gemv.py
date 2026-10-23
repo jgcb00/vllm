@@ -85,3 +85,29 @@ direct_register_custom_op(
 
 def olala_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.olala_linear(x, weight)
+
+
+def cat_rows_shared(params: list[torch.nn.Parameter], pad_to: int = 1) -> torch.Tensor:
+    """Row-concatenate ``params`` and rebind each one to its slice of the result.
+
+    The concatenated decode weight then costs no extra memory (a separate copy
+    is ~0.8 GB over the 36 layers, a fifth of the KV budget on a 20 GB GPU).
+    Row slices of a contiguous tensor keep the parameters' shapes and strides,
+    and in-place weight reloads (``param.data.copy_``) land in the shared
+    storage, so the concatenation never goes stale.
+
+    With ``pad_to`` > 1 the buffer gets zero rows up to a multiple of ``pad_to`` (the returned
+    tensor includes them): cuBLAS picks Hopper kernels only for aligned output widths.
+    """
+    with torch.no_grad():
+        n_rows = sum(p.shape[0] for p in params)
+        n_pad = -(-n_rows // pad_to) * pad_to
+        ref = params[0].data
+        w = torch.zeros(n_pad, *ref.shape[1:], dtype=ref.dtype, device=ref.device)
+        torch.cat([p.data for p in params], 0, out=w[:n_rows])
+        off = 0
+        for p in params:
+            n = p.shape[0]
+            p.data = w[off : off + n]
+            off += n
+    return w

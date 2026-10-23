@@ -27,7 +27,7 @@ from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.mamba.olala.decode_gemv import decode_gemv
+from vllm.model_executor.layers.mamba.olala.decode_gemv import cat_rows_shared, decode_gemv
 from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
@@ -75,6 +75,7 @@ _FUSE_ROTARY_MAX_BATCH = 64
 # kernel needs tilelang and the step kernel the CuTe DSL.
 _mamba3_mimo = None
 _mamba3_mimo_grouped = None
+_mamba3_mimo_hybrid_pools = None
 _mamba3_step_fn = None
 _apply_rotary_qk_inference_fwd = None
 
@@ -84,7 +85,10 @@ def _is_pow2(n: int) -> bool:
 
 
 def _lazy_import_kernels() -> None:
-    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn
+    global _mamba3_mimo, _mamba3_mimo_grouped, _mamba3_step_fn, _mamba3_mimo_hybrid_pools
+    if os.environ.get("OLALA_SYNC_DEBUG") == "1" and not getattr(torch, "_olala_sync_dbg", False):  # debug: report host syncs (warn)
+        torch._olala_sync_dbg = True
+        torch.cuda.set_sync_debug_mode("warn")
     global _apply_rotary_qk_inference_fwd
     if _mamba3_mimo is not None:
         return
@@ -107,6 +111,13 @@ def _lazy_import_kernels() -> None:
     # OLALA_GROUPED_PREFILL=0.
     if os.environ.get("OLALA_GROUPED_PREFILL", "1") != "0":
         _mamba3_mimo_grouped = mamba3_mimo_varlen_grouped
+    # Chunk-parallel exact prefill (Triton chunk-state phases + one TileLang pass over
+    # 128-token chunks): every chunk of every sequence runs in parallel. OLALA_M3_PREFILL=tilelang
+    # restores the serial-per-sequence path.
+    if os.environ.get("OLALA_M3_PREFILL", "hybrid") == "hybrid":
+        from vllm.model_executor.layers.mamba.ops.mamba3.mimo_ssd import mamba3_mimo_hybrid_pools
+
+        _mamba3_mimo_hybrid_pools = mamba3_mimo_hybrid_pools
 
 
 @triton.jit
@@ -217,6 +228,61 @@ def _decode_preamble_bc_kernel(
         if ZERO_CENTERED:
             wsel = wsel + 1.0
         tl.store(bn_cn_ptr + q * S + offs_s, (vals * inv * wsel).to(bn_cn_ptr.dtype.element_ty))
+
+
+@triton.jit
+def _prefill_prologue_kernel(
+    zxdt_ptr, stride_zxdt, bc_ptr, stride_bc,
+    x_ptr, z_ptr,  # out (T, H, D) contiguous
+    dt_ptr, adt_ptr, trap_ptr,  # out (H, T): fp32 softplus(dt + dt_bias), fp32 A*DT, raw trap
+    q_ptr, k_ptr,  # out (T, R, S): C_norm(C), B_norm(B)
+    ang_ptr,  # out (T, NA) fp32
+    dt_bias_ptr, a_floor, wb_ptr, wc_ptr, eps,
+    T, H, R, n_pre,
+    D: tl.constexpr, S: tl.constexpr, NA: tl.constexpr, BT: tl.constexpr, ZERO_CENTERED: tl.constexpr,
+    R2: tl.constexpr,
+):
+    """Prefill counterpart of _decode_preamble_bc_kernel, in one launch: programs [0, n_pre) handle a
+    (BT-token tile, head) of the in_proj output (z/x copies and the dt / A / trap chain, written
+    head-major), the others one token's B / C RMS norms and its rotary angles."""
+    pid = tl.program_id(0)
+    if pid < n_pre:
+        h = pid % H
+        t = (pid // H) * BT + tl.arange(0, BT)
+        tm = t < T
+        d = tl.arange(0, D)
+        zrow = zxdt_ptr + t[:, None].to(tl.int64) * stride_zxdt + h * (2 * D + 3)
+        tl.store(z_ptr + (t[:, None].to(tl.int64) * H + h) * D + d[None, :], tl.load(zrow + d[None, :], mask=tm[:, None]), mask=tm[:, None])
+        tl.store(x_ptr + (t[:, None].to(tl.int64) * H + h) * D + d[None, :], tl.load(zrow + D + d[None, :], mask=tm[:, None]), mask=tm[:, None])
+        b1 = zxdt_ptr + t.to(tl.int64) * stride_zxdt + h * (2 * D + 3) + 2 * D
+        dt = tl.load(b1, mask=tm, other=0.0).to(tl.float32)
+        a = tl.load(b1 + 1, mask=tm, other=0.0).to(tl.float32)
+        trap = tl.load(b1 + 2, mask=tm, other=0.0)
+        sp_a = tl.where(a > 20.0, a, tl.log(1.0 + tl.exp(a)))
+        v = dt + tl.load(dt_bias_ptr + h).to(tl.float32)
+        sp_dt = tl.where(v > 20.0, v, tl.log(1.0 + tl.exp(v)))
+        tl.store(dt_ptr + h * T + t, sp_dt, mask=tm)
+        tl.store(adt_ptr + h * T + t, tl.minimum(-sp_a, -a_floor) * sp_dt, mask=tm)
+        tl.store(trap_ptr + h * T + t, trap, mask=tm)
+    else:
+        # one token per program: its R B rows and R C rows (the bc row is [B (R x S) | C (R x S) | angles])
+        tok = (pid - n_pre).to(tl.int64)
+        j = tl.arange(0, R2)
+        is_c = j >= R2 // 2
+        offs = tl.arange(0, S)
+        vals = tl.load(bc_ptr + tok * stride_bc + j[:, None] * S + offs[None, :]).to(tl.float32)
+        inv = 1.0 / tl.sqrt(tl.sum(vals * vals, axis=1) / S + eps)
+        # same roundings as OlalaRMSNorm: rms_norm output in the activation dtype, gain (1 + w)
+        # in the parameter dtype, product rounded once more
+        w = tl.where(is_c[:, None], tl.load(wc_ptr + offs)[None, :], tl.load(wb_ptr + offs)[None, :])
+        if ZERO_CENTERED:
+            w = (w.to(tl.float32) + 1.0).to(wb_ptr.dtype.element_ty)
+        y = ((vals * inv[:, None]).to(q_ptr.dtype.element_ty).to(tl.float32) * w.to(tl.float32)).to(q_ptr.dtype.element_ty)
+        r = j % (R2 // 2)
+        tl.store(k_ptr + (tok * (R2 // 2) + r[:, None]) * S + offs[None, :], y, mask=~is_c[:, None])
+        tl.store(q_ptr + (tok * (R2 // 2) + r[:, None]) * S + offs[None, :], y, mask=is_c[:, None])
+        na = tl.arange(0, NA)
+        tl.store(ang_ptr + tok * NA + na, tl.load(bc_ptr + tok * stride_bc + R2 * S + na).to(tl.float32))
 
 
 class OlalaMamba3Mixer(PluggableLayer, MambaBase):
@@ -342,6 +408,16 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         self._decode_const_w: tuple[torch.Tensor, ...] | None = None
 
         self._postgate_norm = getattr(config, "mamba3_postgate_norm", False)
+        pow2 = lambda n: n > 0 and (n & (n - 1)) == 0  # noqa: E731
+        self._hybrid_ok = (
+            self.ngroups == 1
+            and self.in_proj.bias is None
+            and self.in_proj_dyn.bias is None
+            and pow2(self.headdim)
+            and pow2(self.d_state)
+            and pow2(2 * self.mimo_dim)
+            and self.num_rope_angles == self.d_state // self.rotary_dim_divisor
+        )
         if self._postgate_norm:
             # Per-rank local-shard norm: each rank normalizes only its own
             # d_inner slice, which differs numerically from a global RMSNorm
@@ -416,8 +492,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
 
         attn_metadata = get_forward_context().attn_metadata
         if attn_metadata is None:
-            # Profiling / dry run.
-            out.zero_()
+            self._dry_run_prefill(hidden_states, out)
             return
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
@@ -467,16 +542,20 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         batch 1. Otherwise the two parallel linears.
         """
         if self._in_proj_cat_ok:
-            w = self._in_proj_cat_w
-            if w is None:
-                w = torch.cat([self.in_proj.weight, self.in_proj_dyn.weight], 0).contiguous()
-                self._in_proj_cat_w = w
+            w = self._in_proj_cat_weight()
             out = decode_gemv(u, w) if u.shape[0] == 1 else F.linear(u, w)
             n1 = self.in_proj.weight.shape[0]
             return out[:, :n1], out[:, n1:]
         zxdt, _ = self.in_proj(u)
         bc, _ = self.in_proj_dyn(u)
         return zxdt, bc
+
+    def _in_proj_cat_weight(self) -> torch.Tensor:
+        if self._in_proj_cat_w is None:
+            self._in_proj_cat_w = cat_rows_shared(
+                [self.in_proj.weight, self.in_proj_dyn.weight]
+            )
+        return self._in_proj_cat_w
 
     def _project_in(self, h: torch.Tensor):
         """Run in_proj/in_proj_dyn on ``(N, D)`` and unpack the pieces."""
@@ -518,6 +597,14 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         md: Mamba3AttentionMetadata,
         pools: tuple[torch.Tensor, ...],
     ) -> None:
+        if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok:
+            # pool slots read / written in place by the kernels (no host sync, no gathers)
+            self._prefill_hybrid(
+                h, out, slots, md.query_start_loc_p, pools,
+                md.has_initial_state if md.has_initial_any else None,
+                md.query_start_loc_p_cpu,
+            )
+            return
         # Fast path: every prompt starts from zero state, so one packed varlen
         # launch covers the batch. OlalaForCausalLMConfig disables chunked
         # prefill precisely to keep us here.
@@ -537,6 +624,27 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             qsl_cpu=md.query_start_loc_p_cpu,
         )
 
+    def _dry_run_prefill(self, h: torch.Tensor, out: torch.Tensor) -> None:
+        """Profiling / dry run: the real prefill over the batch as one sequence,
+        on scratch one-slot pools. The memory profiler then sees the prefill
+        activation peak (sizing the KV cache from a zeroed output left too
+        little headroom on 20 GB GPUs), and the TileLang / Triton JIT and
+        autotuning run before the KV cache is allocated."""
+        if self._in_proj_cat_ok:
+            self._in_proj_cat_weight()  # decode-time weight cache, before KV sizing
+        n = h.shape[0]
+        if n == 0 or torch.cuda.is_current_stream_capturing():
+            out.zero_()
+            return
+        pools = tuple(
+            torch.zeros((1, *shape), dtype=dtype, device=h.device)
+            for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
+        )
+        slots = torch.zeros(1, dtype=torch.long, device=h.device)
+        qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
+        self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
+
+    @staticmethod
     def _gather_init_states(
         pools: tuple[torch.Tensor, ...],
         slots: torch.Tensor,
@@ -572,6 +680,9 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         init_states: tuple[torch.Tensor, ...] | None = None,
         qsl_cpu: torch.Tensor | None = None,
     ) -> None:
+        if _mamba3_mimo_hybrid_pools is not None and self._hybrid_ok and init_states is None:
+            self._prefill_hybrid(h, out, slots, qsl, pools, None, qsl_cpu)
+            return
         angle_pool, ssm_pool, k_pool, v_pool = pools
         z, x, dt, A, trap, B, C, angle = self._project_in(h)
         z = z.unsqueeze(0)  # (1, T, H, p)
@@ -662,6 +773,59 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             y = self.output_norm(y)
         out.copy_(y.to(out.dtype))
 
+    def _prefill_hybrid(self, h, out, slots, qsl, pools, has_init, qsl_cpu):
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        T = h.shape[0]
+        H, D, R, S = self.nheads_local, self.headdim, self.mimo_dim, self.d_state
+        zxdt, _ = self.in_proj(h)
+        bc, _ = self.in_proj_dyn(h)
+        dev, dt_ = h.device, zxdt.dtype
+        x = torch.empty(T, H, D, device=dev, dtype=dt_)
+        z = torch.empty(T, H, D, device=dev, dtype=dt_)
+        DT = torch.empty(H, T, device=dev, dtype=torch.float32)
+        ADT = torch.empty(H, T, device=dev, dtype=torch.float32)
+        trap = torch.empty(H, T, device=dev, dtype=dt_)
+        Q = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
+        K = torch.empty(T, R, S, device=dev, dtype=torch.bfloat16)
+        ang = torch.empty(T, self.num_rope_angles, device=dev, dtype=torch.float32)
+        BT = 16
+        n_pre = triton.cdiv(T, BT) * H
+        _prefill_prologue_kernel[(n_pre + T,)](
+            zxdt, zxdt.stride(0), bc, bc.stride(0), x, z, DT, ADT, trap, Q, K, ang,
+            self.dt_bias, self.A_floor, self.B_norm.norm.weight, self.C_norm.norm.weight, self.B_norm.norm.eps,
+            T, H, R, n_pre, D=D, S=S, NA=self.num_rope_angles, BT=BT,
+            ZERO_CENTERED=self.B_norm.norm.zero_centered, R2=2 * R, num_warps=2,
+        )
+        cw = self._prefill_const_w
+        if cw is None:
+            cw = (
+                self.C_bias.to(torch.float32),
+                self.B_bias.to(torch.float32),
+                self.in_proj_mimo_x.to(torch.float32),
+                self.in_proj_mimo_z.to(torch.float32),
+                self.out_proj_mimo.to(torch.float32),
+                self.D.to(torch.float32),
+            )
+            self._prefill_const_w = cw
+        q_bias, k_bias, mimo_v, mimo_z, mimo_out, d_f32 = cw
+        if qsl_cpu is None:
+            qsl_cpu = qsl.cpu()
+        cu = [int(v) for v in qsl_cpu.tolist()]
+        angle_pool, ssm_pool, k_pool, v_pool = pools
+        assert (ssm_pool.stride()[1:] == (D * S, S, 1) and k_pool.stride()[1:] == (H * S, S, 1)
+                and v_pool.stride()[1:] == (D, 1) and angle_pool.stride()[1:] == (self.num_rope_angles, 1))
+        direct = not self._postgate_norm and out.dtype == x.dtype and out.is_contiguous()
+        o_buf = out.view(T, H, D) if direct else torch.empty(T, H, D, device=dev, dtype=x.dtype)
+        _mamba3_mimo_hybrid_pools(
+            Q, K, x, z, ang, DT, ADT, trap, q_bias, k_bias, mimo_v, mimo_out, mimo_z, d_f32, cu,
+            pools, slots, has_init, o_buf,
+        )
+        if not direct:
+            y = o_buf.reshape(T, -1)
+            if self._postgate_norm:
+                y = self.output_norm(y)
+            out.copy_(y.to(out.dtype))
+
     # -- Decode -------------------------------------------------------------
     def refresh_weight_caches(self) -> None:
         """Refresh the cached weight-derived tensors after a weight reload.
@@ -714,6 +878,8 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
                 ):
                     dst.copy_(src)
             refresh_f32_cache()
+            # Normally a self-copy (cat_rows_shared): only matters if a reload
+            # rebound param.data instead of copying into it.
             w = self._in_proj_cat_w
             if w is not None:
                 n1 = self.in_proj.weight.shape[0]

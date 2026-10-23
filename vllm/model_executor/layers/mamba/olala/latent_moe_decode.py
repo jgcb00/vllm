@@ -16,6 +16,8 @@ token count then happens inside the op, where torch.compile cannot
 specialize it away.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -31,7 +33,7 @@ from vllm.utils.torch_utils import (
 SMALL_BATCH_MAX_TOKENS = 8
 # Above this many tokens the concatenated-projection path costs more in
 # activation traffic than it saves in launches (measured on 24k prefills).
-FUSED_PROJ_MAX_TOKENS = 512
+FUSED_PROJ_MAX_TOKENS = int(os.environ.get("OLALA_FUSED_PROJ_MAX_TOKENS", "512"))
 
 
 @triton.jit
@@ -41,7 +43,8 @@ def _latent_moe_up_kernel(
     bias_ptr,    # [E] fp32 e_score_correction_bias
     ids_ptr,     # [M*K] int32 out (written by the nb == 0 programs)
     tw_ptr,      # [M*K] fp32 out routing weights (normalized)
-    w1_ptr,      # [E, N, D] bf16
+    w1_ptr,      # [E, N, D] bf16, or int8 with per-row scales
+    w1s_ptr,     # [E, N] fp32 scales (int8 weights only)
     h_ptr,       # [M*K, N] bf16 out
     E: tl.constexpr,
     D: tl.constexpr,
@@ -49,6 +52,7 @@ def _latent_moe_up_kernel(
     BN: tl.constexpr,
     BD: tl.constexpr,
     K: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
 ):
     """Expert up-projection + relu^2 for one (token, slot k, N-block).
 
@@ -90,6 +94,8 @@ def _latent_moe_up_kernel(
         x = tl.load(x_ptr + m * D + offs_d).to(tl.float32)
         w = tl.load(w1_ptr + e64 * N * D + offs_n[:, None] * D + offs_d[None, :])
         acc += tl.sum(w.to(tl.float32) * x[None, :], axis=1)
+    if HAS_SCALE:
+        acc *= tl.load(w1s_ptr + e64 * N + offs_n)
     h = acc.to(tl.bfloat16).to(tl.float32)
     h = tl.maximum(h, 0.0)
     h = h * h
@@ -101,12 +107,14 @@ def _latent_moe_down_partial_kernel(
     h_ptr,      # [M*K, N1] bf16
     ids_ptr,    # [M*K] int32
     tw_ptr,     # [M*K] fp32 routing weights
-    w2_ptr,     # [E, D2, N1] bf16
+    w2_ptr,     # [E, D2, N1] bf16, or int8 with per-row scales
+    w2s_ptr,    # [E, D2] fp32 scales (int8 weights only)
     part_ptr,   # [M*K, D2] fp32 out (routing weight applied)
     N1: tl.constexpr,
     D2: tl.constexpr,
     BN: tl.constexpr,
     BD: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
 ):
     row = tl.program_id(0)  # m * K + k
     nb = tl.program_id(1)
@@ -119,6 +127,8 @@ def _latent_moe_down_partial_kernel(
         h = tl.load(h_ptr + row * N1 + offs_d).to(tl.float32)
         w = tl.load(w2_ptr + e * D2 * N1 + offs_n[:, None] * N1 + offs_d[None, :])
         acc += tl.sum(w.to(tl.float32) * h[None, :], axis=1)
+    if HAS_SCALE:
+        acc *= tl.load(w2s_ptr + e * D2 + offs_n)
     tl.store(part_ptr + row * D2 + offs_n, acc * wk)
 
 
@@ -193,9 +203,12 @@ def olala_moe_small(
     w2: torch.Tensor,             # [E, latent, inter]
     top_k: int,
     routed_scale: float,
+    w13_scale: torch.Tensor | None = None,  # [E, inter] fp32 (int8 w13)
+    w2_scale: torch.Tensor | None = None,   # [E, latent] fp32 (int8 w2)
 ) -> torch.Tensor:
     """Small-batch latent MoE. ``w_in``/``w_out`` are the cached concatenations
-    of the latent and shared-expert projections (see OlalaLatentMoE)."""
+    of the latent and shared-expert projections (see OlalaLatentMoE). int8
+    expert weights (experts_int8) are dequantized per row in the kernels."""
     M = hidden.shape[0]
     dev = hidden.device
     E, N1, D1 = w13.shape
@@ -208,13 +221,17 @@ def olala_moe_small(
     x_in = decode_gemv(hidden, w_in)                 # [M, D1 + S]: latent | shared pre-act
     latent = x_in[:, :D1].contiguous()
     h = torch.empty(M * top_k, N1, dtype=hidden.dtype, device=dev)
+    q13 = w13.dtype == torch.int8
+    q2 = w2.dtype == torch.int8
     _latent_moe_up_kernel[(M * top_k, N1 // 16)](
-        latent, router_logits, e_score_bias, topk_ids, topk_w, w13, h,
-        E=E, D=D1, N=N1, BN=16, BD=64, K=top_k, num_warps=4,
+        latent, router_logits, e_score_bias, topk_ids, topk_w, w13,
+        w13_scale if q13 else topk_w, h,
+        E=E, D=D1, N=N1, BN=16, BD=64, K=top_k, HAS_SCALE=q13, num_warps=4,
     )
     part = torch.empty(M * top_k, D2, dtype=torch.float32, device=dev)
     _latent_moe_down_partial_kernel[(M * top_k, D2 // 8)](
-        h, topk_ids, topk_w, w2, part, N1=N1, D2=D2, BN=8, BD=256, num_warps=4,
+        h, topk_ids, topk_w, w2, w2_scale if q2 else topk_w, part,
+        N1=N1, D2=D2, BN=8, BD=256, HAS_SCALE=q2, num_warps=4,
     )
     cat = torch.empty(M, D2 + S, dtype=hidden.dtype, device=dev)
     _latent_moe_epilogue_kernel[(M, (D2 + S) // 128)](
