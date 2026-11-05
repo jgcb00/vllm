@@ -32,9 +32,12 @@ from vllm.model_executor.layers.mamba.olala.fallback import warn_slow_path
 from vllm.model_executor.layers.mamba.olala.mamba3_step_cuda import (
     cuda_step_enabled,
     cuda_step_supported,
+    mamba3_replay_step,
     mamba3_step_cuda,
     refresh_f32_cache,
+    replay_step_supported,
 )
+from vllm.model_executor.layers.mamba.olala.replay import replay_reset
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -45,6 +48,7 @@ from vllm.model_executor.layers.mamba.olala.norm import OlalaNorm
 from vllm.model_executor.layers.mamba.olala.state import (
     mamba3_state_dtype,
     mamba3_state_shape,
+    replay_config,
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -425,6 +429,28 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             self.output_norm = OlalaNorm(self.d_inner // tp, eps=eps, zero_centered=zc)
             set_weight_attrs(self.output_norm.norm.weight, head_shard)
 
+        self._replay = replay_config()
+        if self._replay is not None:
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "OLALA_REPLAY_SSM does not support speculative decoding yet "
+                    "(the verify step reads the full state); unset it."
+                )
+            if not (
+                replay_step_supported(
+                    self.nheads_local, self.headdim, self.d_state, self.mimo_dim,
+                    self.num_rope_angles, self.ngroups,
+                )
+                and self._hybrid_ok
+                and not self._postgate_norm
+            ):
+                raise ValueError(
+                    "OLALA_REPLAY_SSM needs sm_89+ and the Olala 7A1B Mamba3 shapes "
+                    f"(headdim 64, d_state 128, mimo 4, 32 angles, 1 group; got "
+                    f"{self.headdim}/{self.d_state}/{self.mimo_dim}/"
+                    f"{self.num_rope_angles}/{self.ngroups})."
+                )
+
         # Register in the static forward-context table so the runner can find
         # this layer's metadata by prefix.
         compilation = get_current_vllm_config().compilation_config
@@ -445,7 +471,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         )
         # The CuteDSL step kernel indexes the pools in place, so their dtypes
         # are a hard precondition rather than something we can cast around.
-        _, ssm_dtype, k_dtype, v_dtype = dtypes
+        _, ssm_dtype, k_dtype, v_dtype = dtypes[:4]
         if ssm_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
                 f"Olala mamba3 supports an fp32 or bf16 SSM state, got "
@@ -496,26 +522,34 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             return
         md: Mamba3AttentionMetadata = attn_metadata[self.prefix]
 
-        pools = self.kv_cache
+        all_pools = self.kv_cache
+        pools = tuple(all_pools[:4])  # (angle, ssm, k, v); ReplaySSM tensors follow
         slots = md.state_indices_tensor
         ndt, npt = md.num_decode_tokens, md.num_prefill_tokens
 
         if md.num_decodes > 0:
             if md.spec is not None:
                 self._decode_spec(hidden_states[:ndt], out[:ndt], md.spec, pools)
+            elif self._replay is not None:
+                self._decode_replay(
+                    hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], all_pools
+                )
             else:
                 self._decode(
                     hidden_states[:ndt], out[:ndt], slots[: md.num_decodes], pools
                 )
 
         if md.num_prefills > 0:
+            prefill_slots = slots[md.num_decodes : md.num_decodes + md.num_prefills]
             self._prefill(
                 hidden_states[ndt : ndt + npt],
                 out[ndt : ndt + npt],
-                slots[md.num_decodes : md.num_decodes + md.num_prefills],
+                prefill_slots,
                 md,
                 pools,
             )
+            if self._replay is not None:
+                replay_reset(all_pools, prefill_slots.to(torch.int32))
 
     # -- Projections --------------------------------------------------------
     def _decode_preamble(self, zxdt, bc, n, H, D, R, S):
@@ -639,7 +673,7 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
         pools = tuple(
             torch.zeros((1, *shape), dtype=dtype, device=h.device)
             for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
-        )
+        )[:4]
         slots = torch.zeros(1, dtype=torch.long, device=h.device)
         qsl = torch.tensor([0, n], dtype=torch.int32, device=h.device)
         self._prefill_zero_start(h, out, slots, qsl, pools, qsl_cpu=torch.tensor([0, n]))
@@ -1134,6 +1168,31 @@ class OlalaMamba3Mixer(PluggableLayer, MambaBase):
             if self._postgate_norm:
                 y = self.output_norm(y)
             out.copy_(y.to(out.dtype))
+
+    def _decode_replay(
+        self,
+        u: torch.Tensor,  # (N, D)
+        out: torch.Tensor,  # (N, d_inner_local)
+        slots: torch.Tensor,  # (N,)
+        pools: tuple[torch.Tensor, ...],
+    ) -> None:
+        """ReplaySSM decode step (csrc/mamba3_replay_step.cu): reads the
+        checkpoint (fp8 copy when enabled) and the ring, appends this token,
+        and rebuilds + rewrites the full state only when the ring fills."""
+        H, D = self.nheads_local, self.headdim
+        R, S = self.mimo_dim, self.d_state
+        zxdt, bc = self._decode_in_proj(u)
+        x, z, _A, DT, trap, bn_cn = self._decode_preamble(zxdt, bc, u.shape[0], H, D, R, S)
+        bias_q, bias_k, xpj, zpj, outpj = self._decode_const_weights()
+        y_is_out = out.dtype == x.dtype and out.is_contiguous()
+        y = out.view(out.shape[0], H, D) if y_is_out else torch.empty_like(x)
+        mamba3_replay_step(
+            pools, _A, bn_cn[:, 0], bn_cn[:, 1], self.D, x, DT, trap,
+            xpj, zpj, outpj, z, bias_q, bias_k, bc[:, 2 * R * S :],
+            slots.to(torch.int32).contiguous(), y,
+        )
+        if not y_is_out:
+            out.copy_(y.reshape(out.shape[0], -1).to(out.dtype))
 
 
 def olala_mamba3(
