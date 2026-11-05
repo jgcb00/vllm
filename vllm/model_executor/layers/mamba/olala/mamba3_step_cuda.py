@@ -119,3 +119,41 @@ def mamba3_step_cuda(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, t
     A, dt, trap = _as_f32(A), _as_f32(dt), _as_f32(trap)
     _load().step(ssm_pool, k_pool, v_pool, angle_pool, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
                  bias_q, bias_k, angle_proj, slots, y, ctas_per_sm)
+
+
+# -- ReplaySSM (csrc/mamba3_replay_step.cu) ----------------------------------
+
+
+@lru_cache(maxsize=1)
+def _load_replay():
+    from vllm.model_executor.layers.mamba.olala.jit import load_extension
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = f"{major}{minor}"
+    return load_extension(
+        f"olala_mamba3_replay_step_sm{sm}",
+        "mamba3_replay_step.cu",
+        ["-O3", "-std=c++17", f"-gencode=arch=compute_{sm},code=sm_{sm}"],
+    )
+
+
+def replay_step_supported(num_heads_local, head_dim, d_state, rank, num_angles, ngroups) -> bool:
+    return (
+        head_dim == 64 and d_state == 128 and rank == 4 and num_angles == 32
+        and ngroups == 1 and num_heads_local > 0
+        and torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+    )
+
+
+def mamba3_replay_step(pools, A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
+                       bias_q, bias_k, angle_proj, slots, y) -> None:
+    """ReplaySSM decode step. ``pools`` is the full Olala Mamba3 state tuple
+    (see ``state.mamba3_state_shape``); B, C: (N, R, S) pre-bias/rotation
+    views (any batch stride); angle_proj: (N, 32) view."""
+    angle, anchor, kp, vp, xr, br, thr, scr, cnt = pools[:9]
+    rd, rd_scale = (pools[9], pools[10]) if len(pools) > 9 else (None, None)
+    Dp = _fp32(Dp)
+    A, dt, trap = _as_f32(A), _as_f32(dt), _as_f32(trap)
+    _load_replay().step(angle, anchor, rd, rd_scale, kp, vp, xr, br, thr, scr, cnt,
+                        A, B, C, Dp, x, dt, trap, xproj, zproj, outproj, z,
+                        bias_q, bias_k, angle_proj, slots, y)
